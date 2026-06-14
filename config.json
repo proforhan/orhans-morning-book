@@ -1,0 +1,73 @@
+{
+  "newsletter_name": "Orhan's Morning Book",
+  "recipients": [
+    "orhanerdem@gmail.com",
+    "drsukranerdem@gmail.com"
+  ],
+  "timezone": "America/Chicago",
+  "lookback_hours": 30,
+  "top_news_items": 8,
+  "max_research_stories": 1,
+  "claude_model": "claude-sonnet-4-6",
+  "claude_max_tokens": 4000,
+  "ft_feed": "https://www.ft.com/myft/following/1579c2fc-7580-4a63-869f-c7b932346645.rss",
+  "weather_locations": [
+    { "city": "Irving, TX", "latitude": 32.814, "longitude": -96.9489 },
+    { "city": "Dallas, TX", "latitude": 32.7767, "longitude": -96.797 }
+  ],
+  "chart_sources": [
+    {
+      "id": "walmart_inflation",
+      "title": "Walmart Basket Price Index",
+      "image_path": "C:\\Users\\orhan\\My Drive\\My papers and works\\Walmart Shopping Cart\\Walmart_Inflation_Tracker.png",
+      "trigger_path": "C:\\Users\\orhan\\My Drive\\My papers and works\\Walmart Shopping Cart\\Walmart Inflation Tracker.gsheet",
+      "caption": "Monthly price movement in the tracked Walmart shopping basket.",
+      "explanation": "The index tracks how the cost of a consistent Walmart basket changes over time. It offers a household-level view of price pressure that can be compared with broader inflation measures.",
+      "source": "Walmart Inflation Tracker",
+      "priority": 20
+    },
+    {
+      "id": "zillow_texas",
+      "title": "Texas Home Prices: Selected Cities",
+      "image_path": "C:\\Users\\orhan\\My Drive\\Data\\US\\Real Estate\\Zillow\\TX house prices agent\\output\\TX_Selected_Cities_10Y_Home_Prices.png",
+      "trigger_path": "C:\\Users\\orhan\\My Drive\\Data\\US\\Real Estate\\Zillow\\TX house prices agent\\output\\TX_Selected_Cities_10Y_Home_Prices.png",
+      "caption": "Ten-year Zillow Home Value Index trends for selected Texas cities.",
+      "explanation": "The chart compares the long-run path of typical home values across selected Texas cities, including Dallas, Frisco, Irving, and Plano. The latest movement shows where housing momentum is strengthening, cooling, or diverging across local markets.",
+      "source": "Zillow Research",
+      "source_url": "https://www.zillow.com/research/data/",
+      "priority": 15
+    }
+  ],
+  "thought_leaders": [
+    {
+      "name": "Adam Tooze",
+      "handle": "@adam_tooze",
+      "url": "https://x.com/adam_tooze",
+      "feeds": [
+        "https://adamtooze.substack.com/feed"
+      ],
+      "news_query": "\"Adam Tooze\" when:2d"
+    },
+    {
+      "name": "Brad Setser",
+      "handle": "@Brad_Setser",
+      "url": "https://x.com/Brad_Setser",
+      "feeds": [
+        "https://www.cfr.org/blog/setser/feed"
+      ],
+      "news_query": "\"Brad Setser\" when:2d"
+    },
+    {
+      "name": "Mark Zandi",
+      "handle": "@Markzandi",
+      "url": "https://x.com/Markzandi",
+      "feeds": [],
+      "news_query": "\"Mark Zandi\" when:2d"
+    }
+  ],
+  "nitter_instances": [
+    "https://nitter.net",
+    "https://nitter.poast.org",
+    "https://nitter.privacyredirect.com"
+  ]
+}

@@ -1,0 +1,5 @@
+.gmail-smtp.credential.xml
+.claude-api.credential.xml
+output/
+__pycache__/
+*.pyc
