@@ -1,0 +1,82 @@
+name: Morning Intelligence
+
+on:
+  schedule:
+    # GitHub cron is UTC and has no DST awareness, so we fire at BOTH the
+    # CDT (summer) and CST (winter) equivalents of 7:00 AM Central and let the
+    # guard step below let exactly one of them through each day.
+    - cron: "0 12 * * *"   # 07:00 America/Chicago during CDT (UTC-5)
+    - cron: "0 13 * * *"   # 07:00 America/Chicago during CST (UTC-6)
+  workflow_dispatch:
+    inputs:
+      test_only:
+        description: "Send only to Orhan and do not consume chart-of-the-day state"
+        type: boolean
+        default: true
+
+# Never let two runs overlap (e.g. a manual run during the scheduled window).
+concurrency:
+  group: morning-intelligence
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # lets the run commit the small chart-state file back
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Decide whether this run should proceed
+        id: guard
+        run: |
+          HOUR=$(TZ=America/Chicago date +%H)
+          echo "Current Central time hour: $HOUR"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$HOUR" != "07" ]; then
+            echo "Scheduled run at the off-DST hour; skipping to avoid a double send."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.guard.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install fonts and dependencies
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-dejavu-core
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate and send the newsletter
+        if: steps.guard.outputs.run == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # On a manual test run, restrict delivery and preserve rotation state.
+          OMI_RECIPIENTS: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_only) && 'orhanerdem@gmail.com' || '' }}
+          OMI_PRESERVE_CHART_STATE: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_only) && 'true' || '' }}
+        run: python main.py
+
+      - name: Persist chart-of-the-day state
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          if [ -f output/chart_of_the_day_state.json ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -f output/chart_of_the_day_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update chart-of-the-day state [skip ci]"
+              git push
+            else
+              echo "No chart-state change to commit."
+            fi
+          fi
