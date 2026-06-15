@@ -49,11 +49,6 @@ TOPIC_WEIGHTS = {
     "science": 6, "research": 7, "study": 6, "arxiv": 7,
     "medicine": 7, "health": 6, "clinical": 7, "cancer": 7, "drug": 6,
     "world cup": 6, "football": 4, "soccer": 5,
-    # Corporate finance / markets / space (added so major business events such
-    # as IPOs are not scored at ~0 relevance and crowded out before curation).
-    " ipo ": 9, "public offering": 8, "stock market": 6, "nasdaq": 5,
-    "merger": 6, "acquisition": 6, "earnings": 5, "elon musk": 6,
-    "spacex": 6, "starlink": 5, "satellite": 4, "rocket": 4,
 }
 
 SOURCE_BONUS = {
@@ -80,7 +75,6 @@ NEWS_FEEDS = [
     ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
     ("Google News: AI", "https://news.google.com/rss/search?q=artificial+intelligence+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("Google News: Economics & Finance", "https://news.google.com/rss/search?q=economics+finance+financial+markets+when:1d&hl=en-US&gl=US&ceid=US:en"),
-    ("Google News: Markets & Business", "https://news.google.com/rss/search?q=IPO+OR+%22stock+market%22+OR+earnings+OR+merger+OR+acquisition+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("Google News: Science", "https://news.google.com/rss/search?q=science+research+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("Google News: Medicine", "https://news.google.com/rss/search?q=medicine+healthcare+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("Google News: World Cup", "https://news.google.com/rss/search?q=FIFA+World+Cup+when:1d&hl=en-US&gl=US&ceid=US:en"),
@@ -216,97 +210,16 @@ def canonical_title(title: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", title)
 
 
-# Common words that carry no topical signal, so two stories sharing only these
-# should NOT be treated as the same underlying story.
-STOPWORDS = frozenset({
-    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for", "with",
-    "as", "at", "by", "from", "is", "are", "was", "were", "be", "been", "has",
-    "have", "had", "its", "it", "this", "that", "these", "those", "after",
-    "over", "into", "amid", "says", "say", "said", "new", "how", "why", "what",
-    "who", "will", "could", "would", "may", "than", "then", "up", "down", "out",
-    "off", "about", "more", "most", "first", "amp", "his", "her", "their",
-})
-
-
-def significant_tokens(text: str) -> set[str]:
-    """Lower-cased content words (length >= 3, no stopwords) used for matching."""
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return {token for token in tokens if len(token) >= 3 and token not in STOPWORDS}
-
-
-def is_same_story(a: Story, b: Story, title_only: bool = False) -> bool:
-    """True when two items almost certainly cover the same underlying event.
-
-    Uses content-word overlap. When descriptions are available they add a lot
-    of signal, so the default compares title+description; `title_only=True`
-    falls back to headlines for the cheap first pass.
-    """
-    if title_only:
-        ta, tb = significant_tokens(a.title), significant_tokens(b.title)
-        jaccard_floor, subset_floor, subset_min = 0.6, 0.8, 3
-    else:
-        ta = significant_tokens(f"{a.title} {a.description}")
-        tb = significant_tokens(f"{b.title} {b.description}")
-        jaccard_floor, subset_floor, subset_min = 0.5, 0.7, 5
-    if not ta or not tb:
-        return False
-    overlap = len(ta & tb)
-    smaller = min(len(ta), len(tb))
-    jaccard = overlap / len(ta | tb)
-    # Sharing several uncommon, longer content words (e.g. "spacex", "nasdaq",
-    # "debut") is a strong same-event signal even when overall overlap is low,
-    # because the headlines were written independently. This catches the same
-    # story reported by different outlets in different words.
-    distinctive_shared = sum(1 for token in (ta & tb) if len(token) >= 5)
-    if distinctive_shared >= 3:
-        return True
-    # Either the sets broadly agree (jaccard), or the shorter headline is mostly
-    # contained in the longer one (subset) -- which catches a terse wire headline
-    # versus a longer rewrite of the same story.
-    return jaccard >= jaccard_floor or (smaller >= subset_min and overlap / smaller >= subset_floor)
-
-
 def deduplicate(stories: list[Story]) -> list[Story]:
-    """Drop exact and near-duplicate headlines, keeping the first (highest-ranked
-    when callers pass a sorted list)."""
+    seen: set[str] = set()
     result: list[Story] = []
-    seen_exact: set[str] = set()
     for story in stories:
         key = " ".join(canonical_title(story.title).split()[:12])
         digest = hashlib.sha1(key.encode()).hexdigest()[:12]
-        if digest in seen_exact:
-            continue
-        if any(is_same_story(story, kept, title_only=True) for kept in result):
-            continue
-        seen_exact.add(digest)
-        result.append(story)
+        if digest not in seen:
+            seen.add(digest)
+            result.append(story)
     return result
-
-
-def enforce_distinct(selected: list[Story], pool: list[Story], target: int) -> list[Story]:
-    """Guarantee no two Top News items cover the same underlying story.
-
-    Removes any later near-duplicate from the curated list (comparing
-    title+description for maximum signal) and back-fills with the next-best
-    distinct candidate so the section keeps its target length.
-    """
-    final: list[Story] = []
-    for story in selected:
-        if any(is_same_story(story, kept) for kept in final):
-            continue
-        final.append(story)
-    chosen = {id(story) for story in final}
-    keep = min(target, len(selected))
-    if len(final) < keep:
-        for story in pool:
-            if len(final) >= target:
-                break
-            if id(story) in chosen or any(is_same_story(story, kept) for kept in final):
-                continue
-            heuristic_text(story)  # back-filled item was not summarised by Claude
-            final.append(story)
-            chosen.add(id(story))
-    return final
 
 
 def rank(story: Story, now: dt.datetime) -> float:
@@ -321,8 +234,7 @@ def rank(story: Story, now: dt.datetime) -> float:
     title_signal = min(6, len(story.description) / 120)
     impact = sum(
         2 for term in ("announces", "launches", "approves", "breakthrough", "war", "ceasefire",
-                       "federal reserve", "inflation", "clinical trial", "study finds",
-                       " ipo ", "public offering", "goes public", "acquires", "merger")
+                       "federal reserve", "inflation", "clinical trial", "study finds")
         if term in text
     )
     return relevance * 1.8 + source + age_bonus + title_signal + impact - penalty
@@ -546,9 +458,7 @@ def claude_curate(
         "research, medicine, and the football World Cup. Rank by Impact x Novelty x Relevance, "
         "weighting relevance heavily toward AI, economics, finance, academic research, and "
         "medicine. Avoid celebrity news, entertainment, low-impact political commentary, "
-        "investment-promotion content, and duplicate coverage of the same underlying story. "
-        "Treat two items as duplicates if they describe the same underlying event even when the "
-        "headlines, wording, or sources differ; pick only the single best version of each story.\n\n"
+        "investment-promotion content, and duplicate coverage of the same underlying story.\n\n"
         f"From news_candidates choose exactly {top_n} items (fewer only if the pool is smaller), "
         "ordered most consequential first, covering a diverse mix of the priority topics. For each "
         "write 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
@@ -682,9 +592,15 @@ def load_chart_state() -> dict[str, Any]:
 
 def chart_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = (
-        [r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\segoeuib.ttf"]
+        [r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\segoeuib.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+         "DejaVuSans-Bold.ttf"]
         if bold else
-        [r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf"]
+        [r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "DejaVuSans.ttf"]
     )
     for path in candidates:
         try:
@@ -875,13 +791,361 @@ def fred_chart_sources() -> list[dict[str, Any]]:
     return sources
 
 
+def draw_dual_line_chart(path: Path, series: list[tuple[str, str, list[tuple[str, float]]]],
+                         title: str, subtitle: str, footer: str) -> None:
+    """Draw up to two labelled index lines sharing one axis (matches house style)."""
+    width, height = 600, 320
+    left, top, right, bottom = 58, 84, 22, 50
+    image = Image.new("RGB", (width, height), "#FAF7F0")
+    draw = ImageDraw.Draw(image)
+    title_font = chart_font(20, bold=True)
+    label_font = chart_font(11)
+    small_font = chart_font(10)
+    draw.text((left, 15), title, fill="#17324D", font=title_font)
+    draw.text((left, 40), subtitle, fill="#555555", font=small_font)
+
+    all_values = [value for _, _, points in series for _, value in points]
+    if not all_values:
+        return
+    spread = max(0.5, max(all_values) - min(all_values))
+    y_min = min(all_values) - spread * 0.2
+    y_max = max(all_values) + spread * 0.2
+    labels = [label for label, _ in series[0][2]]
+    n = max(1, len(labels) - 1)
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    def point(index: int, value: float) -> tuple[float, float]:
+        x = left + index * plot_width / n
+        y = top + (y_max - value) * plot_height / (y_max - y_min)
+        return x, y
+
+    tick_step = max(0.5, round((y_max - y_min) / 5 * 2) / 2)
+    tick = y_min
+    while tick <= y_max:
+        y = point(0, tick)[1]
+        if top <= y <= height - bottom:
+            draw.line((left, y, width - right, y), fill="#D6D6D6", width=1)
+            draw.text((6, y - 6), f"{tick:.1f}", fill="#666666", font=small_font)
+        tick += tick_step
+
+    for index, label in enumerate(labels):
+        x = point(index, y_min)[0]
+        draw.text((x - 10, height - bottom + 8), label, fill="#666666", font=small_font)
+
+    colors = ["#17324D", "#8A2D3C"]
+    legend_x = left
+    for order, (name, _, points) in enumerate(series):
+        color = colors[order % len(colors)]
+        pts = [point(i, value) for i, (_, value) in enumerate(points)]
+        draw.line(pts, fill=color, width=3, joint="curve")
+        last_x, last_y = pts[-1]
+        draw.ellipse((last_x - 4, last_y - 4, last_x + 4, last_y + 4), fill=color)
+        draw.text((last_x - 26, last_y + (6 if order else -16)),
+                  f"{points[-1][1]:.2f}", fill=color, font=label_font)
+        draw.rectangle((legend_x, 60, legend_x + 14, 70), fill=color)
+        draw.text((legend_x + 18, 59), name, fill="#444444", font=small_font)
+        legend_x += 20 + int(draw.textlength(name, font=small_font)) + 18
+
+    draw.text((left, height - 16), footer, fill="#777777", font=small_font)
+    path.parent.mkdir(exist_ok=True)
+    image.save(path, format="PNG", optimize=True)
+
+
+def _parse_sheet_csv(raw: bytes) -> list[dict[str, str]]:
+    text = raw.decode("utf-8-sig", errors="replace")
+    return list(csv.reader(text.splitlines()))
+
+
+def sheet_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the Walmart basket chart directly from the shared Google Sheet.
+
+    The chart is redrawn from live data each run; a content signature drives the
+    'feature once when the numbers change' behaviour, so no local file mtimes or
+    manual PNG exports are involved.
+    """
+    spec = config.get("walmart_sheet")
+    if not spec or not spec.get("csv_url"):
+        return []
+    chart_path = OUTPUT / "walmart_sheet.png"
+    try:
+        rows = _parse_sheet_csv(fetch(spec["csv_url"]))
+    except Exception:
+        return []
+
+    # Locate the header row and the columns we need by name.
+    header_idx = next(
+        (i for i, r in enumerate(rows)
+         if any(c.strip().lower() == "date" for c in r)),
+        None,
+    )
+    if header_idx is None:
+        return []
+    header = [c.strip() for c in rows[header_idx]]
+
+    def col(*names: str) -> int | None:
+        for name in names:
+            for j, c in enumerate(header):
+                if c.lower() == name.lower():
+                    return j
+        return None
+
+    date_c = col("Date")
+    basket_c = col("Walmart Index")
+    official_c = col("US Official Index")
+    if date_c is None or basket_c is None:
+        return []
+
+    basket: list[tuple[str, float]] = []
+    official: list[tuple[str, float]] = []
+    for r in rows[header_idx + 1:]:
+        if len(r) <= date_c or not r[date_c].strip():
+            continue
+        label = r[date_c].strip()[:3]  # "January 2026" -> "Jan"
+        def num(j: int | None) -> float | None:
+            if j is None or len(r) <= j:
+                return None
+            cell = r[j].replace("$", "").replace(",", "").replace("%", "").strip()
+            try:
+                return float(cell)
+            except ValueError:
+                return None
+        b = num(basket_c)
+        if b is None:
+            continue
+        basket.append((label, b))
+        o = num(official_c)
+        if o is not None:
+            official.append((label, o))
+
+    if len(basket) < 2:
+        return []
+
+    signature = hashlib.sha256(
+        json.dumps(basket + official, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    series = [("Walmart basket (Irving, TX)", "#17324D", basket)]
+    if len(official) >= 2:
+        series.append(("US official CPI (normalized)", "#8A2D3C", official))
+
+    latest = basket[-1][1]
+    prior = basket[-2][1]
+    direction = "rose from" if latest > prior else "eased from" if latest < prior else "was unchanged from"
+    explanation = (
+        f"The tracked Walmart basket index stood at {latest:.2f} "
+        f"(Jan 2026 = 100) in {basket[-1][0]}; the index {direction} {prior:.2f} the month before."
+    )
+    if len(official) >= 2:
+        gap = latest - official[-1][1]
+        cmp_word = "below" if gap < 0 else "above" if gap > 0 else "level with"
+        explanation += (
+            f" That leaves the basket running {abs(gap):.2f} points {cmp_word} the "
+            "normalized official CPI over the same window."
+        )
+
+    draw_dual_line_chart(
+        chart_path, series,
+        title=spec.get("title", "Walmart Basket Price Index"),
+        subtitle="Index, Jan 2026 = 100",
+        footer="Source: personal Walmart basket tracker (Irving, TX) + BLS CPI via FRED",
+    )
+    return [{
+        "id": "walmart_sheet",
+        "title": spec.get("title", "Walmart Basket Price Index"),
+        "image_path": str(chart_path),
+        "trigger_path": str(chart_path),
+        "caption": "Monthly movement in the tracked Walmart shopping basket.",
+        "explanation": explanation,
+        "source": "Walmart Inflation Tracker (personal)",
+        "source_url": spec.get("source_url", ""),
+        "priority": int(spec.get("priority", 20)),
+        "signature": signature,
+    }]
+
+
+def draw_multi_line_chart(path: Path, series: list[tuple[str, list[tuple[dt.date, float]]]],
+                          title: str, subtitle: str, footer: str,
+                          unit: str = "$") -> None:
+    """Draw N labelled dollar-valued lines over a multi-year monthly x-axis."""
+    width, height = 600, 340
+    left, top, right, bottom = 64, 92, 18, 48
+    image = Image.new("RGB", (width, height), "#FAF7F0")
+    draw = ImageDraw.Draw(image)
+    title_font = chart_font(20, bold=True)
+    small_font = chart_font(10)
+    draw.text((left, 15), title, fill="#17324D", font=title_font)
+    draw.text((left, 40), subtitle, fill="#555555", font=small_font)
+
+    palette = ["#17324D", "#8A2D3C", "#2E6E4E", "#B0792C", "#5B4B8A", "#447099"]
+    all_points = [p for _, pts in series for p in pts]
+    if not all_points:
+        return
+    values = [v for _, v in all_points]
+    dates = [d for d, _ in all_points]
+    spread = max(1.0, max(values) - min(values))
+    y_min = min(values) - spread * 0.1
+    y_max = max(values) + spread * 0.1
+    d_min, d_max = min(dates), max(dates)
+    span_days = max(1, (d_max - d_min).days)
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    def point(d: dt.date, value: float) -> tuple[float, float]:
+        x = left + (d - d_min).days / span_days * plot_width
+        y = top + (y_max - value) * plot_height / (y_max - y_min)
+        return x, y
+
+    def money(v: float) -> str:
+        return f"${v/1000:.0f}k" if unit == "$" else f"{v:.1f}{unit}"
+
+    for frac in range(0, 6):
+        v = y_min + (y_max - y_min) * frac / 5
+        y = top + (y_max - v) * plot_height / (y_max - y_min)
+        draw.line((left, y, width - right, y), fill="#D6D6D6", width=1)
+        draw.text((6, y - 6), money(v), fill="#666666", font=small_font)
+
+    year_step = 2 if (d_max.year - d_min.year) > 6 else 1
+    for year in range(d_min.year + 1, d_max.year + 1, year_step):
+        d = dt.date(year, 1, 1)
+        if d_min <= d <= d_max:
+            x = point(d, y_min)[0]
+            draw.text((x - 11, height - bottom + 8), str(year), fill="#666666", font=small_font)
+
+    legend_x = left
+    for order, (name, pts) in enumerate(series):
+        color = palette[order % len(palette)]
+        line = [point(d, v) for d, v in pts]
+        draw.line(line, fill=color, width=3, joint="curve")
+        last_x, last_y = line[-1]
+        draw.ellipse((last_x - 4, last_y - 4, last_x + 4, last_y + 4), fill=color)
+        draw.rectangle((legend_x, 62, legend_x + 14, 72), fill=color)
+        draw.text((legend_x + 18, 61), name, fill="#444444", font=small_font)
+        legend_x += 20 + int(draw.textlength(name, font=small_font)) + 18
+        if legend_x > width - 90:           # wrap the legend onto a second row
+            legend_x = left
+    draw.text((left, height - 14), footer, fill="#777777", font=small_font)
+    path.parent.mkdir(exist_ok=True)
+    image.save(path, format="PNG", optimize=True)
+
+
+def zillow_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the Texas-cities home-price chart from Zillow's public ZHVI CSV.
+
+    Streams the (large) city-level file, keeps only the configured cities in the
+    configured state, and redraws a 10-year line per city. Any failure (e.g.
+    Zillow moved the download path) simply yields no chart.
+    """
+    spec = config.get("zillow")
+    if not spec or not spec.get("csv_url"):
+        return []
+    targets = {c.lower() for c in spec.get("cities", [])}
+    state = spec.get("state", "TX")
+    years = int(spec.get("years", 10))
+    if not targets:
+        return []
+
+    try:
+        text = fetch(spec["csv_url"]).decode("utf-8-sig", errors="replace")
+    except Exception:
+        return []
+    reader = csv.reader(text.splitlines())
+    try:
+        header = next(reader)
+    except StopIteration:
+        return []
+    idx = {name: i for i, name in enumerate(header)}
+    date_cols = [(i, dt.date.fromisoformat(name))
+                 for i, name in enumerate(header)
+                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}", name)]
+    if not date_cols or "RegionName" not in idx or "State" not in idx:
+        return []
+    latest_date = date_cols[-1][1]
+    cutoff = latest_date.replace(year=latest_date.year - years)
+
+    found: dict[str, list[tuple[dt.date, float]]] = {}
+    for row in reader:
+        if len(row) <= idx["State"]:
+            continue
+        if row[idx["State"]].strip() != state:
+            continue
+        name = row[idx["RegionName"]].strip()
+        if name.lower() not in targets:
+            continue
+        pts: list[tuple[dt.date, float]] = []
+        for col, d in date_cols:
+            if d < cutoff or len(row) <= col or not row[col].strip():
+                continue
+            try:
+                pts.append((d, float(row[col])))
+            except ValueError:
+                continue
+        if len(pts) >= 2:
+            found[name] = pts
+
+    if not found:
+        return []
+    # Preserve the configured city order; only include cities actually found.
+    ordered = [(c, found[c]) for c in spec.get("cities", []) if c in found]
+    signature = hashlib.sha256(
+        json.dumps({c: [(d.isoformat(), round(v, 1)) for d, v in p] for c, p in ordered},
+                   separators=(",", ":")).encode()
+    ).hexdigest()
+
+    chart_path = OUTPUT / "zillow_texas.png"
+    draw_multi_line_chart(
+        chart_path, ordered,
+        title=spec.get("title", "Texas Home Prices: Selected Cities"),
+        subtitle=f"Zillow Home Value Index, last {years} years",
+        footer="Source: Zillow Research (ZHVI, mid-tier, smoothed & seasonally adjusted)",
+    )
+    newest = max((p[-1] for _, p in ordered), key=lambda x: x[0])
+    explanation = (
+        "Typical home values across "
+        + ", ".join(c for c, _ in ordered)
+        + f", on Zillow's Home Value Index through {newest[0].strftime('%B %Y')}. "
+        "The chart shows where local housing momentum is strengthening, cooling, or diverging."
+    )
+    return [{
+        "id": "zillow_texas",
+        "title": spec.get("title", "Texas Home Prices: Selected Cities"),
+        "image_path": str(chart_path),
+        "trigger_path": str(chart_path),
+        "caption": "Ten-year Zillow Home Value Index trends for selected Texas cities.",
+        "explanation": explanation,
+        "source": "Zillow Research",
+        "source_url": spec.get("source_url", "https://www.zillow.com/research/data/"),
+        "priority": int(spec.get("priority", 15)),
+        "signature": signature,
+    }]
+
+
 def select_chart_of_the_day(config: dict[str, Any]) -> dict[str, Any] | None:
     state = load_chart_state()
     candidates: list[dict[str, Any]] = []
     sources = [{**source, "priority": source.get("priority", 100)}
                for source in config.get("chart_sources", [])]
     sources.extend(fred_chart_sources())
+    sources.extend(sheet_chart_sources(config))
+    sources.extend(zillow_chart_sources(config))
     for source in sources:
+        # Content-signature charts (sheet/FRED in the cloud) feature once per
+        # data change and do not rely on local file modification times.
+        signature = source.get("signature")
+        if signature is not None:
+            if not Path(source["image_path"]).is_file():
+                continue
+            if state.get(source["id"], {}).get("featured_signature") == signature:
+                continue
+            now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
+            candidates.append({
+                **source,
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "updated_mtime": now_ts,
+                "image_mtime": now_ts,
+            })
+            continue
+
         image_path = Path(source["image_path"])
         trigger_path = Path(source.get("trigger_path", source["image_path"]))
         if not image_path.is_file() or not trigger_path.exists():
@@ -910,10 +1174,13 @@ def mark_chart_featured(chart: dict[str, Any] | None) -> None:
     if not chart:
         return
     state = load_chart_state()
-    state[chart["id"]] = {
+    entry = {
         "featured_mtime": chart["updated_mtime"],
         "featured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    if chart.get("signature") is not None:
+        entry["featured_signature"] = chart["signature"]
+    state[chart["id"]] = entry
     CHART_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
@@ -1071,7 +1338,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
           <strong>{esc(config['newsletter_name'])}</strong>
         </font><br>
         <font face="Arial, sans-serif" color="#DDE7EF" size="2">
-          <strong>{esc(date_label)}</strong>
+          <strong>{esc(date_label)} &nbsp;·&nbsp; MORNING EDITION</strong>
         </font>
       </td></tr>
       </table>
@@ -1096,7 +1363,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#17324D">
       <tr><td align="center">
         <font face="Arial, sans-serif" color="#FFFFFF" size="2">
-          <strong>{esc(config['newsletter_name'].upper())}</strong> &nbsp;·&nbsp; A PERSONAL FIVE-MINUTE BRIEFING
+          <strong>ORHAN'S MORNING INTELLIGENCE</strong> &nbsp;·&nbsp; A PERSONAL FIVE-MINUTE BRIEFING
         </font>
       </td></tr>
       </table>
@@ -1123,10 +1390,10 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
     if not user or not password:
         raise RuntimeError("Set GMAIL_USER and GMAIL_APP_PASSWORD to enable SMTP delivery.")
     msg = EmailMessage()
-    msg["From"] = f"{config['newsletter_name']} <{user}>"
+    msg["From"] = f"Orhan's Morning Intelligence <{user}>"
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
-    msg.set_content(f"{config['newsletter_name']} is best viewed as HTML.")
+    msg.set_content("Orhan's Morning Intelligence is best viewed as HTML.")
     msg.add_alternative(body, subtype="html")
     chart = select_chart_of_the_day(config)
     if chart and "cid:chart-of-the-day" in body:
@@ -1193,9 +1460,6 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     top, leader_post, research_pick = claude_curate(
         news_candidates, leader_candidates, research_candidates, config, errors,
     )
-    # Final safety net: never let two Top News items cover the same story,
-    # regardless of whether Claude or the heuristic fallback made the picks.
-    top = enforce_distinct(top, news_candidates, int(config.get("top_news_items", 8)))
     research_items = [research_pick] if research_pick else []
 
     total_items = len(top) + (1 if leader_post else 0)

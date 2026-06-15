@@ -1,5 +1,5 @@
 {
-  "newsletter_name": "Orhan's Morning Book",
+  "newsletter_name": "Orhan's Morning Intelligence",
   "recipients": [
     "orhanerdem@gmail.com",
     "drsukranerdem@gmail.com"
@@ -11,6 +11,21 @@
   "claude_model": "claude-sonnet-4-6",
   "claude_max_tokens": 4000,
   "ft_feed": "https://www.ft.com/myft/following/1579c2fc-7580-4a63-869f-c7b932346645.rss",
+  "walmart_sheet": {
+    "csv_url": "https://docs.google.com/spreadsheets/d/1qOdMjkWm0JccWKO6gTpHF5wDVZE3MuQj6oKXnURuKVk/gviz/tq?tqx=out:csv&sheet=Walmart%20Basket",
+    "title": "Walmart Basket Price Index",
+    "source_url": "https://docs.google.com/spreadsheets/d/1qOdMjkWm0JccWKO6gTpHF5wDVZE3MuQj6oKXnURuKVk/edit",
+    "priority": 20
+  },
+  "zillow": {
+    "csv_url": "https://files.zillowstatic.com/research/public_csvs/zhvi/City_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
+    "title": "Texas Home Prices: Selected Cities",
+    "source_url": "https://www.zillow.com/research/data/",
+    "state": "TX",
+    "cities": ["Dallas", "Frisco", "Irving", "Plano"],
+    "years": 10,
+    "priority": 15
+  },
   "weather_locations": [
     { "city": "Irving, TX", "latitude": 32.814, "longitude": -96.9489 },
     { "city": "Dallas, TX", "latitude": 32.7767, "longitude": -96.797 }
