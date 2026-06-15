@@ -1,4 +1,4 @@
-"""Orhan's Morning Intelligence.
+"""Orhan's Morning Times.
 
 Daily, mobile-friendly morning newsletter covering AI, economics and finance,
 technology, science, academic research, medicine, and limited major
