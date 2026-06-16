@@ -32,13 +32,32 @@ jobs:
       - name: Decide whether this run should proceed
         id: guard
         run: |
+          TODAY=$(TZ=America/Chicago date +%F)
           HOUR=$(TZ=America/Chicago date +%H)
-          echo "Current Central time hour: $HOUR"
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$HOUR" != "07" ]; then
-            echo "Scheduled run at the off-DST hour; skipping to avoid a double send."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
+          LAST=$(cat output/last_sent.txt 2>/dev/null || echo "none")
+          echo "Central date=$TODAY hour=$HOUR | last sent=$LAST | event=${{ github.event_name }}"
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run: proceeding."
             echo "run=true" >> "$GITHUB_OUTPUT"
+            # Only a real (non-test) manual run should claim today's slot.
+            if [ "${{ inputs.test_only }}" = "true" ]; then
+              echo "mark=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "mark=true" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "$LAST" = "$TODAY" ]; then
+            echo "Today's edition already went out; skipping this trigger."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "mark=false" >> "$GITHUB_OUTPUT"
+          elif [ "$HOUR" -ge 7 ]; then
+            echo "Not yet sent today and it is past 7am Central: proceeding."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "mark=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Before 7am Central; skipping (the next trigger will send)."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "mark=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Python
@@ -66,17 +85,24 @@ jobs:
           OMI_PRESERVE_CHART_STATE: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_only) && 'true' || '' }}
         run: python main.py
 
-      - name: Persist chart-of-the-day state
+      - name: Record today's send
+        if: steps.guard.outputs.run == 'true' && steps.guard.outputs.mark == 'true'
+        run: |
+          mkdir -p output
+          echo "${{ steps.guard.outputs.today }}" > output/last_sent.txt
+
+      - name: Persist run state
         if: steps.guard.outputs.run == 'true'
         run: |
-          if [ -f output/chart_of_the_day_state.json ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add -f output/chart_of_the_day_state.json
-            if ! git diff --cached --quiet; then
-              git commit -m "Update chart-of-the-day state [skip ci]"
-              git push
-            else
-              echo "No chart-state change to commit."
-            fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          changed=false
+          for f in output/chart_of_the_day_state.json output/last_sent.txt; do
+            if [ -f "$f" ]; then git add -f "$f" && changed=true; fi
+          done
+          if [ "$changed" = "true" ] && ! git diff --cached --quiet; then
+            git commit -m "Update run state [skip ci]"
+            git push
+          else
+            echo "No state change to commit."
           fi
