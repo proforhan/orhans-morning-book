@@ -2,11 +2,16 @@ name: Morning Intelligence
 
 on:
   schedule:
-    # GitHub cron is UTC and has no DST awareness, so we fire at BOTH the
-    # CDT (summer) and CST (winter) equivalents of 7:00 AM Central and let the
-    # guard step below let exactly one of them through each day.
-    - cron: "0 12 * * *"   # 07:00 America/Chicago during CDT (UTC-5)
-    - cron: "0 13 * * *"   # 07:00 America/Chicago during CST (UTC-6)
+    # Best-effort GitHub cron, kept only as a backstop behind the external
+    # 6 AM trigger. Times are a few minutes past the hour (the :00 slot is the
+    # most-dropped). The "already sent today" guard means these skip whenever
+    # the external trigger already delivered.
+    - cron: "17 11 * * *"   # ~06:17 America/Chicago during CDT (UTC-5)
+    - cron: "17 12 * * *"   # ~06:17 America/Chicago during CST (UTC-6)
+    - cron: "17 13 * * *"   # later backstop if both above were dropped
+  repository_dispatch:
+    # Punctual external trigger (e.g. cron-job.org) posts event_type below.
+    types: [send-newsletter]
   workflow_dispatch:
     inputs:
       test_only:
@@ -50,12 +55,16 @@ jobs:
             echo "Today's edition already went out; skipping this trigger."
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "mark=false" >> "$GITHUB_OUTPUT"
-          elif [ "$HOUR" -ge 7 ]; then
-            echo "Not yet sent today and it is past 7am Central: proceeding."
+          elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "Punctual external trigger: proceeding (no clock floor)."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "mark=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HOUR" -ge 6 ]; then
+            echo "Not yet sent today and it is past 6am Central: proceeding."
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "mark=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Before 7am Central; skipping (the next trigger will send)."
+            echo "Before 6am Central; skipping (the next trigger will send)."
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "mark=false" >> "$GITHUB_OUTPUT"
           fi
