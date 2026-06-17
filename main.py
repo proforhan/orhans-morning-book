@@ -453,7 +453,7 @@ def claude_curate(
         "research_candidates": pack(research_candidates, 10),
     }
     prompt = (
-        "You are the editor of 'Orhan's Morning Intelligence', a concise daily briefing for a "
+        "You are the editor of 'Orhan's Morning Times', a concise daily briefing for a "
         "university professor interested in AI, economics, finance, technology, science, academic "
         "research, medicine, and the football World Cup. Rank by Impact x Novelty x Relevance, "
         "weighting relevance heavily toward AI, economics, finance, academic research, and "
@@ -1120,7 +1120,169 @@ def zillow_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
     }]
 
 
-def select_chart_of_the_day(config: dict[str, Any]) -> dict[str, Any] | None:
+# --- GDP per capita: rotating top-10 by world region (World Bank WDI) ---------
+
+# World Bank 2-letter country ids grouped by continent. Aggregates (World, EU,
+# OECD, etc.) are deliberately absent, so they are filtered out automatically.
+_CONTINENT_CODES = {
+    "Africa": "DZ AO BJ BW BF BI CV CM CF TD KM CD CG CI DJ EG GQ ER SZ ET GA GM "
+              "GH GN GW KE LS LR LY MG MW ML MR MU MA MZ NA NE NG RW ST SN SC SL "
+              "SO ZA SS SD TZ TG TN UG ZM ZW",
+    "Asia": "AF AM AZ BH BD BT BN KH CN GE HK IN ID IR IQ IL JP JO KZ KW KG LA LB "
+            "MO MY MV MN MM NP KP OM PK PS PH QA SA SG KR LK SY TW TJ TH TL TR TM "
+            "AE UZ VN YE",
+    "Europe": "AL AD AT BY BE BA BG HR CY CZ DK EE FI FR DE GR HU IS IE IT XK LV "
+              "LI LT LU MT MD MC ME NL MK NO PL PT RO RU SM RS SK SI ES SE CH UA GB",
+    "Americas": "AG AR BS BB BZ BO BR CA CL CO CR CU DM DO EC SV GD GT GY HT HN JM "
+                "MX NI PA PY PE PR KN LC VC SR TT US UY VE",
+    "Oceania": "AU FJ KI MH FM NR NZ PW PG WS SB TO TV VU",
+}
+_CONTINENT = {
+    code: continent
+    for continent, codes in _CONTINENT_CODES.items()
+    for code in codes.split()
+}
+
+
+def draw_bar_chart(path: Path, items: list[tuple[str, float]], title: str,
+                   subtitle: str, footer: str) -> None:
+    """Horizontal top-N bar chart (e.g. dollar-valued rankings)."""
+    width, left, right = 640, 168, 78
+    top_pad, row_h, bottom = 78, 27, 34
+    height = top_pad + len(items) * row_h + bottom
+    image = Image.new("RGB", (width, height), "#FAF7F0")
+    draw = ImageDraw.Draw(image)
+    title_font = chart_font(20, bold=True)
+    label_font = chart_font(12)
+    small_font = chart_font(10)
+    draw.text((20, 15), title, fill="#17324D", font=title_font)
+    draw.text((20, 44), subtitle, fill="#555555", font=small_font)
+    max_v = max((v for _, v in items), default=1.0) or 1.0
+    bar_area = width - left - right
+    for i, (name, v) in enumerate(items):
+        y = top_pad + i * row_h
+        bar_w = max(2.0, bar_area * v / max_v)
+        draw.rectangle((left, y + 3, left + bar_w, y + row_h - 6), fill="#17324D")
+        label = name if len(name) <= 22 else name[:21] + "…"
+        tw = draw.textlength(label, font=label_font)
+        draw.text((left - 8 - tw, y + 5), label, fill="#333333", font=label_font)
+        draw.text((left + bar_w + 6, y + 5), f"${v:,.0f}", fill="#8A2D3C", font=label_font)
+    draw.text((20, height - 18), footer, fill="#777777", font=small_font)
+    path.parent.mkdir(exist_ok=True)
+    image.save(path, format="PNG", optimize=True)
+
+
+def _worldbank_latest(indicator: str, end_year: int) -> dict[str, tuple[float, int, str]]:
+    """Most recent non-null value per country for a World Bank indicator."""
+    url = (f"https://api.worldbank.org/v2/country/all/indicator/{indicator}"
+           f"?format=json&date={end_year - 3}:{end_year}&per_page=20000")
+    data = json.loads(fetch(url, timeout=40))
+    if not isinstance(data, list) or len(data) < 2 or not data[1]:
+        return {}
+    best: dict[str, tuple[float, int, str]] = {}
+    for entry in data[1]:
+        value = entry.get("value")
+        if value is None:
+            continue
+        country = entry.get("country") or {}
+        code = country.get("id")
+        try:
+            year = int(entry.get("date"))
+        except (TypeError, ValueError):
+            continue
+        if not code:
+            continue
+        if code not in best or year > best[code][1]:
+            best[code] = (float(value), year, country.get("value", code))
+    return best
+
+
+def gdp_per_capita_chart_sources(config: dict[str, Any], now: dt.datetime,
+                                 state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Quarterly walk through every region's top-10 GDP-per-capita ranking.
+
+    Once per calendar quarter the newsletter features each region in turn, one
+    per day, in the configured order; after the whole set has run it goes
+    dormant until the next quarter, when the queue resets automatically. A
+    region is only consumed once it is actually featured, so a higher-priority
+    chart on a given day delays the queue rather than skipping a region.
+
+    Built fresh from the World Bank API; any failure simply yields no chart.
+    """
+    spec = config.get("gdp_per_capita")
+    if not spec or not spec.get("enabled", True):
+        return []
+    regions = spec.get("regions") or ["World", "Africa", "Asia", "Europe",
+                                      "Americas", "Oceania"]
+    if state is None:
+        state = load_chart_state()
+    quarter = f"{now.year}-Q{(now.month - 1) // 3 + 1}"
+    entry = state.get("gdp_per_capita", {})
+    shown = entry.get("shown", []) if entry.get("quarter") == quarter else []
+    remaining = [r for r in regions if r not in shown]
+    if not remaining:                      # every region already done this quarter
+        return []
+    region = remaining[0]
+
+    indicator = spec.get("indicator", "NY.GDP.PCAP.CD")
+    try:
+        rows = _worldbank_latest(indicator, now.year)
+    except Exception:
+        return []
+    if not rows:
+        return []
+
+    ranked: list[tuple[str, float, int]] = []
+    for code, (value, year, name) in rows.items():
+        continent = _CONTINENT.get(code)
+        if continent is None:                       # drops aggregates
+            continue
+        if region == "World" or continent == region:
+            ranked.append((name, value, year))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    top = ranked[:10]
+    if len(top) < 3:
+        return []
+
+    latest_year = max(y for _, _, y in top)
+    signature = hashlib.sha256(json.dumps(
+        [quarter, region, [(n, round(v)) for n, v, _ in top]],
+        separators=(",", ":")).encode()).hexdigest()
+    chart_path = OUTPUT / "gdp_per_capita.png"
+    where = "the world" if region == "World" else region
+    draw_bar_chart(
+        chart_path, [(n, v) for n, v, _ in top],
+        title=f"Top 10 GDP per Capita \u2014 {region}",
+        subtitle=f"GDP per capita (current US$), {latest_year}",
+        footer="Source: World Bank, World Development Indicators",
+    )
+    leader = top[0]
+    explanation = (
+        f"{leader[0]} leads {where} on GDP per capita at about ${leader[1]:,.0f} "
+        f"({latest_year}), among countries with available World Bank data. "
+        "Figures are nominal US dollars, not adjusted for local cost of living."
+    )
+    return [{
+        "id": "gdp_per_capita",
+        "title": f"Top 10 GDP per Capita \u2014 {region}",
+        "image_path": str(chart_path),
+        "trigger_path": str(chart_path),
+        "caption": f"Highest GDP per capita in {where}.",
+        "explanation": explanation,
+        "source": "World Bank (WDI)",
+        "source_url": "https://data.worldbank.org/indicator/NY.GDP.PCAP.CD",
+        "priority": int(spec.get("priority", 5)),
+        "signature": signature,
+        # Queue bookkeeping consumed by mark_chart_featured:
+        "gdp_region": region,
+        "gdp_quarter": quarter,
+    }]
+
+
+def select_chart_of_the_day(config: dict[str, Any],
+                            now: dt.datetime | None = None) -> dict[str, Any] | None:
+    if now is None:
+        now = dt.datetime.now(ZoneInfo(config["timezone"]))
     state = load_chart_state()
     candidates: list[dict[str, Any]] = []
     sources = [{**source, "priority": source.get("priority", 100)}
@@ -1128,6 +1290,7 @@ def select_chart_of_the_day(config: dict[str, Any]) -> dict[str, Any] | None:
     sources.extend(fred_chart_sources())
     sources.extend(sheet_chart_sources(config))
     sources.extend(zillow_chart_sources(config))
+    sources.extend(gdp_per_capita_chart_sources(config, now, state))
     for source in sources:
         # Content-signature charts (sheet/FRED in the cloud) feature once per
         # data change and do not rely on local file modification times.
@@ -1180,6 +1343,15 @@ def mark_chart_featured(chart: dict[str, Any] | None) -> None:
     }
     if chart.get("signature") is not None:
         entry["featured_signature"] = chart["signature"]
+    # Quarterly GDP queue: append the region just featured so it is not
+    # repeated until the queue resets next quarter.
+    if chart.get("gdp_region"):
+        prev = state.get(chart["id"], {})
+        shown = list(prev.get("shown", [])) if prev.get("quarter") == chart["gdp_quarter"] else []
+        if chart["gdp_region"] not in shown:
+            shown.append(chart["gdp_region"])
+        entry["quarter"] = chart["gdp_quarter"]
+        entry["shown"] = shown
     state[chart["id"]] = entry
     CHART_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -1363,7 +1535,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#17324D">
       <tr><td align="center">
         <font face="Arial, sans-serif" color="#FFFFFF" size="2">
-          <strong>ORHAN'S MORNING INTELLIGENCE</strong> &nbsp;·&nbsp; A PERSONAL FIVE-MINUTE BRIEFING
+          <strong>{esc(config['newsletter_name'].upper())}</strong> &nbsp;·&nbsp; A PERSONAL FIVE-MINUTE BRIEFING
         </font>
       </td></tr>
       </table>
@@ -1389,11 +1561,12 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
     recipients = [address for address in recipients if address]
     if not user or not password:
         raise RuntimeError("Set GMAIL_USER and GMAIL_APP_PASSWORD to enable SMTP delivery.")
+    name = config.get("newsletter_name", "Orhan's Morning Times")
     msg = EmailMessage()
-    msg["From"] = f"Orhan's Morning Intelligence <{user}>"
+    msg["From"] = f"{name} <{user}>"
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
-    msg.set_content("Orhan's Morning Intelligence is best viewed as HTML.")
+    msg.set_content(f"{name} is best viewed as HTML.")
     msg.add_alternative(body, subtype="html")
     chart = select_chart_of_the_day(config)
     if chart and "cid:chart-of-the-day" in body:
@@ -1466,7 +1639,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     if total_items > 10:
         top = top[:10 - (1 if leader_post else 0)]
 
-    chart_of_day = select_chart_of_the_day(config)
+    chart_of_day = select_chart_of_the_day(config, now)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
                   research_items, chart_of_day, errors)
     OUTPUT.mkdir(exist_ok=True)
@@ -1498,7 +1671,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Intelligence.")
+    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Times.")
     parser.add_argument("--no-send", action="store_true", help="Generate files without sending email.")
     parser.add_argument("--no-ai", action="store_true", help="Use feed descriptions instead of Claude summaries.")
     args = parser.parse_args()

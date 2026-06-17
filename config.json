@@ -1,5 +1,5 @@
 {
-  "newsletter_name": "Orhan's Morning Times",
+  "newsletter_name": "Orhan's Morning Book",
   "recipients": [
     "orhanerdem@gmail.com",
     "drsukranerdem@gmail.com"
@@ -25,6 +25,12 @@
     "cities": ["Dallas", "Frisco", "Irving", "Plano"],
     "years": 10,
     "priority": 15
+  },
+  "gdp_per_capita": {
+    "enabled": true,
+    "indicator": "NY.GDP.PCAP.CD",
+    "regions": ["World", "Africa", "Asia", "Europe", "Americas", "Oceania"],
+    "priority": 5
   },
   "weather_locations": [
     { "city": "Irving, TX", "latitude": 32.814, "longitude": -96.9489 },
