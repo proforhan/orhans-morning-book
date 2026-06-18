@@ -8,5 +8,14 @@
     "featured_mtime": 1781714139.915336,
     "featured_at": "2026-06-17T16:35:43.084156+00:00",
     "featured_signature": "6088ec61f67d301db2e3ab112f0780586d8e5c2e8111a3fc676009ce03a21c93"
+  },
+  "gdp_per_capita": {
+    "featured_mtime": 1781780574.722015,
+    "featured_at": "2026-06-18T11:02:56.809666+00:00",
+    "featured_signature": "35e1115b15d8b240242b5d8a968cd3a0016993e68882a92d0a850ea1ebc43c55",
+    "quarter": "2026-Q2",
+    "shown": [
+      "World"
+    ]
   }
 }
