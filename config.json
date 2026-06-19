@@ -6,7 +6,7 @@
   ],
   "timezone": "America/Chicago",
   "lookback_hours": 30,
-  "top_news_items": 8,
+  "top_news_items": 6,
   "max_research_stories": 1,
   "claude_model": "claude-sonnet-4-6",
   "claude_max_tokens": 4000,

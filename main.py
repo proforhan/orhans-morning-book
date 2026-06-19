@@ -41,13 +41,13 @@ CHART_STATE = OUTPUT / "chart_of_the_day_state.json"
 USER_AGENT = "OrhanMorningIntelligence/2.0 (+personal research newsletter)"
 
 TOPIC_WEIGHTS = {
-    "artificial intelligence": 10, " ai ": 9, "machine learning": 9,
-    "large language model": 9, "openai": 8, "anthropic": 8, "nvidia": 7,
-    "economy": 7, "economic": 7, "inflation": 7, "federal reserve": 7,
-    "interest rate": 7, "market": 5, "trade": 5, "technology": 6,
+    "artificial intelligence": 7, " ai ": 6, "machine learning": 7,
+    "large language model": 7, "openai": 6, "anthropic": 6, "nvidia": 6,
+    "economy": 8, "economic": 8, "inflation": 8, "federal reserve": 8,
+    "interest rate": 8, "market": 6, "trade": 6, "technology": 6,
     "microsoft": 5, "google": 5, "apple": 5, "meta": 5, "amazon": 5,
-    "science": 6, "research": 7, "study": 6, "arxiv": 7,
-    "medicine": 7, "health": 6, "clinical": 7, "cancer": 7, "drug": 6,
+    "science": 7, "research": 7, "study": 7, "arxiv": 7,
+    "medicine": 8, "health": 7, "clinical": 8, "cancer": 8, "drug": 7,
     "world cup": 6, "football": 4, "soccer": 5,
 }
 
@@ -460,7 +460,7 @@ def claude_curate(
         "medicine. Avoid celebrity news, entertainment, low-impact political commentary, "
         "investment-promotion content, and duplicate coverage of the same underlying story.\n\n"
         f"From news_candidates choose exactly {top_n} items (fewer only if the pool is smaller), "
-        "ordered most consequential first, covering a diverse mix of the priority topics. For each "
+        "ordered most consequential first. Deliberately spread coverage across topics: include no more than 2 AI/tech items, and make sure economics/finance, medicine/health, and academic research each appear when qualifying candidates exist. For each "
         "write 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
         "no hype, no invented facts) and 'why' (one short sentence on why it matters to this "
         "reader).\n\n"
@@ -1466,18 +1466,18 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
     for row in weather_rows[:2]:
         weather_cells.append(f"""
         <td width="50%" bgcolor="#EDF3F7" valign="top">
-          <font face="Arial, sans-serif" color="#17324D">
+          <font face="Arial, sans-serif" color="#17324D" size="2">
             <strong>{esc(row['city'])}</strong><br>
-            <font size="6"><strong>{row['current']}°</strong></font><br>
+            <font size="4"><strong>{row['current']}°</strong></font><br>
             {esc(row.get('conditions', ''))}<br>
             H {row['high']}° · L {row['low']}° · Rain {row['rain']}%
           </font>
         </td>""")
     weather_table = f"""
-      <table role="presentation" width="100%" border="0" cellspacing="4" cellpadding="10" bgcolor="#DCE7EE">
+      <table role="presentation" width="100%" border="0" cellspacing="2" cellpadding="4" bgcolor="#DCE7EE">
       <tr>{''.join(weather_cells)}</tr>
       </table>
-      {f'''<p align="center"><img src="{esc(chart_url)}" width="480" style="max-width:100%;height:auto"
+      {f'''<p align="center"><img src="{esc(chart_url)}" width="192" style="max-width:100%;height:auto"
         alt="Line chart comparing today's forecast temperatures in Irving and Dallas, Texas"></p>''' if chart_url else ''}"""
 
     chart_html = ""
@@ -1619,8 +1619,8 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         group.sort(key=lambda x: x.score, reverse=True)
 
     news_candidates = deduplicate(
-        select_diverse(news, 16, per_category=4, per_source=2)
-        + select_diverse(ft_items + economist_items, 6, per_category=6, per_source=3)
+        select_diverse(news, 16, per_category=2, per_source=2)
+        + select_diverse(ft_items + economist_items, 6, per_category=3, per_source=2)
     )
     news_candidates.sort(key=lambda x: x.score, reverse=True)
     research_candidates = select_diverse(research_pool, 10, per_category=4, per_source=2)
@@ -1636,8 +1636,8 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     research_items = [research_pick] if research_pick else []
 
     total_items = len(top) + (1 if leader_post else 0)
-    if total_items > 10:
-        top = top[:10 - (1 if leader_post else 0)]
+    if total_items > 6:
+        top = top[:6 - (1 if leader_post else 0)]
 
     chart_of_day = select_chart_of_the_day(config, now)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
