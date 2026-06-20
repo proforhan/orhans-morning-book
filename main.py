@@ -558,6 +558,40 @@ def load_chart_state() -> dict[str, Any]:
         return {}
 
 
+# Charts are rendered at CHART_SCALE x the logical size so they stay crisp on
+# high-DPI / Retina screens, then displayed at the original CSS width in email.
+CHART_SCALE = 3
+
+
+class ScaledDraw:
+    """Wraps PIL ImageDraw so logical coordinates render at CHART_SCALE x."""
+
+    def __init__(self, image: Image.Image, scale: int = CHART_SCALE) -> None:
+        self._d = ImageDraw.Draw(image)
+        self.scale = scale
+
+    def _mul(self, xy):
+        s = self.scale
+        if isinstance(xy, (list, tuple)) and xy and isinstance(xy[0], (list, tuple)):
+            return [(p[0] * s, p[1] * s) for p in xy]
+        return tuple(v * s for v in xy)
+
+    def text(self, xy, *args, **kwargs):
+        self._d.text(self._mul(xy), *args, **kwargs)
+
+    def line(self, xy, *args, width=1, **kwargs):
+        self._d.line(self._mul(xy), *args, width=int(width * self.scale), **kwargs)
+
+    def ellipse(self, xy, *args, **kwargs):
+        self._d.ellipse(self._mul(xy), *args, **kwargs)
+
+    def rectangle(self, xy, *args, **kwargs):
+        self._d.rectangle(self._mul(xy), *args, **kwargs)
+
+    def textlength(self, text, *args, **kwargs):
+        return self._d.textlength(text, *args, **kwargs) / self.scale
+
+
 def chart_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = (
         [r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\segoeuib.ttf",
@@ -570,12 +604,16 @@ def chart_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageF
          "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
          "DejaVuSans.ttf"]
     )
+    scaled = int(size * CHART_SCALE)
     for path in candidates:
         try:
-            return ImageFont.truetype(path, size)
+            return ImageFont.truetype(path, scaled)
         except OSError:
             continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=scaled)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def fred_observations(series_id: str, start: str) -> list[tuple[dt.date, float]]:
@@ -594,8 +632,8 @@ def draw_line_chart(path: Path, plotted: list[tuple[dt.date, float]], title: str
                     subtitle: str, footer: str, unit: str = "%") -> None:
     width, height = 600, 300
     left, top, right, bottom = 58, 54, 22, 45
-    image = Image.new("RGB", (width, height), "#FAF7F0")
-    draw = ImageDraw.Draw(image)
+    image = Image.new("RGB", (width * CHART_SCALE, height * CHART_SCALE), "#FAF7F0")
+    draw = ScaledDraw(image)
     title_font = chart_font(20, bold=True)
     label_font = chart_font(11)
     small_font = chart_font(10)
@@ -764,8 +802,8 @@ def draw_dual_line_chart(path: Path, series: list[tuple[str, str, list[tuple[str
     """Draw up to two labelled index lines sharing one axis (matches house style)."""
     width, height = 600, 320
     left, top, right, bottom = 58, 84, 22, 50
-    image = Image.new("RGB", (width, height), "#FAF7F0")
-    draw = ImageDraw.Draw(image)
+    image = Image.new("RGB", (width * CHART_SCALE, height * CHART_SCALE), "#FAF7F0")
+    draw = ScaledDraw(image)
     title_font = chart_font(20, bold=True)
     label_font = chart_font(11)
     small_font = chart_font(10)
@@ -938,8 +976,8 @@ def draw_multi_line_chart(path: Path, series: list[tuple[str, list[tuple[dt.date
     """Draw N labelled dollar-valued lines over a multi-year monthly x-axis."""
     width, height = 600, 340
     left, top, right, bottom = 64, 92, 18, 48
-    image = Image.new("RGB", (width, height), "#FAF7F0")
-    draw = ImageDraw.Draw(image)
+    image = Image.new("RGB", (width * CHART_SCALE, height * CHART_SCALE), "#FAF7F0")
+    draw = ScaledDraw(image)
     title_font = chart_font(20, bold=True)
     small_font = chart_font(10)
     draw.text((left, 15), title, fill="#17324D", font=title_font)
@@ -1118,8 +1156,8 @@ def draw_bar_chart(path: Path, items: list[tuple[str, float]], title: str,
     width, left, right = 640, 168, 78
     top_pad, row_h, bottom = 78, 27, 34
     height = top_pad + len(items) * row_h + bottom
-    image = Image.new("RGB", (width, height), "#FAF7F0")
-    draw = ImageDraw.Draw(image)
+    image = Image.new("RGB", (width * CHART_SCALE, height * CHART_SCALE), "#FAF7F0")
+    draw = ScaledDraw(image)
     title_font = chart_font(20, bold=True)
     label_font = chart_font(12)
     small_font = chart_font(10)
