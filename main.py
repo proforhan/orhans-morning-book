@@ -1480,8 +1480,6 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       </td></tr>
       </table>
 
-      {weather_table}
-
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="7" bgcolor="#8A2D3C">
       <tr><td align="center">
         <font face="Arial, sans-serif" color="#FFFFFF" size="2">
@@ -1490,8 +1488,9 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       </td></tr>
       </table>
 
+      {weather_table}
+
       <h2>Good morning</h2>
-      <p>Your high-signal briefing for today. The most consequential items come first.</p>
 
       {section_html("1 · Top News", top_html, "No qualifying stories were available in this run.")}
       {section_html("2 · Research Radar", research_html, "No qualifying research items were available in this run.")}
