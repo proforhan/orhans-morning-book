@@ -545,38 +545,6 @@ def esc(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
-def weather_chart_url(weather_rows: list[dict[str, Any]]) -> str:
-    if not weather_rows or any("hourly_time" not in row for row in weather_rows):
-        return ""
-    labels = [dt.datetime.fromisoformat(x).strftime("%-I %p") if os.name != "nt"
-              else dt.datetime.fromisoformat(x).strftime("%#I %p")
-              for x in weather_rows[0]["hourly_time"][6:22:3]]
-    datasets = []
-    colors = ["#174f78", "#b44b3e"]
-    for index, row in enumerate(weather_rows):
-        datasets.append({
-            "label": row["city"],
-            "data": row["hourly_temp"][6:22:3],
-            "borderColor": colors[index % len(colors)],
-            "backgroundColor": "transparent",
-            "fill": False,
-            "lineTension": 0.25,
-        })
-    chart = {
-        "type": "line",
-        "data": {"labels": labels, "datasets": datasets},
-        "options": {
-            "legend": {"position": "bottom"},
-            "title": {"display": True, "text": "Today's temperature outlook (°F)"},
-            "scales": {"yAxes": [{"ticks": {"beginAtZero": False}}]},
-        },
-    }
-    return "https://quickchart.io/chart?" + urllib.parse.urlencode({
-        "width": 480, "height": 190, "backgroundColor": "white",
-        "c": json.dumps(chart, separators=(",", ":")),
-    })
-
-
 # ---------------------------------------------------------------------------
 # Charts (FRED + configured local charts)
 # ---------------------------------------------------------------------------
@@ -1432,7 +1400,6 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         if os.name != "nt"
         else now.strftime("%B %#d, %Y, %A")
     )
-    chart_url = weather_chart_url(weather_rows)
     unavailable = "; ".join(errors[:6])
     source_note = f"<p><small><strong>Source notes:</strong> {esc(unavailable)}</small></p>" if unavailable else ""
 
@@ -1476,9 +1443,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
     weather_table = f"""
       <table role="presentation" width="100%" border="0" cellspacing="2" cellpadding="4" bgcolor="#DCE7EE">
       <tr>{''.join(weather_cells)}</tr>
-      </table>
-      {f'''<p align="center"><img src="{esc(chart_url)}" width="192" style="max-width:100%;height:auto"
-        alt="Line chart comparing today's forecast temperatures in Irving and Dallas, Texas"></p>''' if chart_url else ''}"""
+      </table>"""
 
     chart_html = ""
     if chart_of_day:
@@ -1515,10 +1480,12 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       </td></tr>
       </table>
 
+      {weather_table}
+
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="7" bgcolor="#8A2D3C">
       <tr><td align="center">
         <font face="Arial, sans-serif" color="#FFFFFF" size="2">
-          WEATHER &nbsp;·&nbsp; TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY
+          TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY
         </font>
       </td></tr>
       </table>
@@ -1526,10 +1493,9 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       <h2>Good morning</h2>
       <p>Your high-signal briefing for today. The most consequential items come first.</p>
 
-      {section_html("1 · Weather Snapshot", weather_table)}
-      {section_html("2 · Top News", top_html, "No qualifying stories were available in this run.")}
-      {section_html("3 · Research Radar", research_html, "No qualifying research items were available in this run.")}
-      {section_html("4 · Chart of the Day", chart_html, "No newly updated chart today; the next release of the Walmart tracker, Zillow data, GDP, or CPI will appear here.")}
+      {section_html("1 · Top News", top_html, "No qualifying stories were available in this run.")}
+      {section_html("2 · Research Radar", research_html, "No qualifying research items were available in this run.")}
+      {section_html("3 · Chart of the Day", chart_html, "No newly updated chart today; the next release of the Walmart tracker, Zillow data, GDP, or CPI will appear here.")}
       {source_note}
 
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#17324D">
