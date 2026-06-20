@@ -38,6 +38,8 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / "output"
 CHART_STATE = OUTPUT / "chart_of_the_day_state.json"
+SEEN_STATE = OUTPUT / "seen_links.json"
+SEEN_LEDGER_DAYS = 3
 USER_AGENT = "OrhanMorningIntelligence/2.0 (+personal research newsletter)"
 
 TOPIC_WEIGHTS = {
@@ -110,11 +112,41 @@ class Story:
     image_url: str = ""
     image_alt: str = ""
     kind: str = "news"   # news | leader | research
-    via: str = ""        # e.g. "X via Nitter", "Substack", "press coverage"
+    via: str = ""        # e.g. "own publication", "press coverage"
 
 
 def load_config() -> dict[str, Any]:
     return json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+
+
+def load_seen_links() -> dict[str, str]:
+    """Links featured in recent editions, pruned to the last SEEN_LEDGER_DAYS."""
+    if not SEEN_STATE.exists():
+        return {}
+    try:
+        data = json.loads(SEEN_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=SEEN_LEDGER_DAYS)).date()
+    kept: dict[str, str] = {}
+    for link, seen_on in data.items():
+        try:
+            if dt.date.fromisoformat(seen_on) >= cutoff:
+                kept[link] = seen_on
+        except (TypeError, ValueError):
+            continue
+    return kept
+
+
+def record_seen_links(links: list[str]) -> None:
+    """Append today's featured links to the ledger (idempotent, pruned)."""
+    seen = load_seen_links()
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    for link in links:
+        if link:
+            seen[link] = today
+    SEEN_STATE.parent.mkdir(exist_ok=True)
+    SEEN_STATE.write_text(json.dumps(seen, indent=2), encoding="utf-8")
 
 
 def fetch(url: str, timeout: int = 20) -> bytes:
@@ -281,20 +313,13 @@ def select_diverse(stories: list[Story], limit: int, per_category: int = 3,
 # Thought Leaders Monitor
 # ---------------------------------------------------------------------------
 
-def original_x_url(link: str, handle: str) -> str:
-    match = re.search(r"/status/(\d+)", link)
-    username = handle.lstrip("@")
-    return f"https://x.com/{username}/status/{match.group(1)}" if match else f"https://x.com/{username}"
-
-
 def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
                             errors: list[str]) -> tuple[list[Story], list[str]]:
     """Best recent public item per configured leader, plus availability notes.
 
     Source priority per leader:
-      1. Direct X posts via public Nitter mirrors (when reachable).
-      2. The leader's own publication feeds (Substack, CFR blog, ...).
-      3. Google News coverage of the leader, clearly labelled as coverage.
+      1. The leader's own publication feeds (Substack, CFR blog, ...).
+      2. Google News coverage of the leader, clearly labelled as coverage.
     """
     cutoff = now.astimezone(dt.timezone.utc) - dt.timedelta(hours=26)
     candidates: list[Story] = []
@@ -302,29 +327,10 @@ def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
     for leader in config.get("thought_leaders", []):
         handle = leader.get("handle", "")
         name = leader.get("name", handle)
-        username = handle.lstrip("@")
         leader_posts: list[Story] = []
 
-        # 1. X via Nitter mirrors.
-        for instance in config.get("nitter_instances", []):
-            try:
-                posts = parse_feed(name, f"{instance}/{urllib.parse.quote(username)}/rss")
-            except Exception:
-                continue
-            for post in posts:
-                if post.published and post.published.astimezone(dt.timezone.utc) < cutoff:
-                    continue
-                if post.title.startswith("RT by "):
-                    continue
-                post.title = re.sub(r"^R to @[^:]+:\s*", "", post.title).strip()
-                post.link = original_x_url(post.link, handle)
-                post.via = "X"
-                leader_posts.append(post)
-            if leader_posts:
-                break
-
-        # 2. Own publications (Substack, blogs).
-        if not leader_posts:
+        # 1. Own publications (Substack, blogs).
+        if True:
             for feed_url in leader.get("feeds", []):
                 try:
                     posts = parse_feed(name, feed_url)
@@ -336,7 +342,7 @@ def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
                     post.via = "own publication"
                     leader_posts.append(post)
 
-        # 3. Press coverage as a clearly-labelled fallback.
+        # 2. Press coverage as a clearly-labelled fallback.
         if not leader_posts and leader.get("news_query"):
             query = urllib.parse.quote(leader["news_query"])
             try:
@@ -358,7 +364,7 @@ def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
                 post.source = f"{name} ({handle})"
                 post.summary = post.title
                 post.score = rank(post, now) + (4 if post.image_url else 0) + (
-                    10 if post.via == "X" else 6 if post.via == "own publication" else 0
+                    6 if post.via == "own publication" else 0
                 )
             candidates.append(max(leader_posts, key=lambda post: post.score))
         else:
@@ -414,11 +420,11 @@ def claude_curate(
     research_candidates: list[Story],
     config: dict[str, Any],
     errors: list[str],
-) -> tuple[list[Story], Story | None, Story | None]:
+) -> tuple[list[Story], Story | None, Story | None, str]:
     """Single Claude call: select, rank, and write summaries for all sections."""
     top_n = int(config.get("top_news_items", 8))
 
-    def fallback() -> tuple[list[Story], Story | None, Story | None]:
+    def fallback() -> tuple[list[Story], Story | None, Story | None, str]:
         top = select_diverse(news_candidates, top_n)
         for story in top:
             heuristic_text(story)
@@ -428,7 +434,7 @@ def claude_curate(
         research = research_candidates[0] if research_candidates else None
         if research:
             heuristic_text(research)
-        return top, leader, research
+        return top, leader, research, ""
 
     if not os.getenv("ANTHROPIC_API_KEY"):
         errors.append("ANTHROPIC_API_KEY unavailable; used heuristic selection and feed summaries.")
@@ -453,7 +459,7 @@ def claude_curate(
         "research_candidates": pack(research_candidates, 10),
     }
     prompt = (
-        "You are the editor of 'Orhan's Morning Times', a concise daily briefing for a "
+        "You are the editor of '" + config['newsletter_name'] + "', a concise daily briefing for a "
         "university professor interested in AI, economics, finance, technology, science, academic "
         "research, medicine, and the football World Cup. Rank by Impact x Novelty x Relevance, "
         "weighting relevance heavily toward AI, economics, finance, academic research, and "
@@ -469,8 +475,10 @@ def claude_curate(
         "From research_candidates choose the single most interesting genuine research item (a "
         "paper, study, or peer-reviewed finding - not general news; null if none qualify) and "
         "write 'summary' (a one-sentence statement of the finding) and 'why' (one sentence).\n\n"
+        "Also write 'tldr': a single punchy sentence (max ~22 words) summarising the most "
+        "important thing the reader should take from today's edition, grounded in the chosen items.\n\n"
         "Return ONLY valid JSON, no markdown fences, in this exact shape:\n"
-        '{"top": [{"id": 0, "summary": "...", "why": "..."}], '
+        '{"tldr": "...", "top": [{"id": 0, "summary": "...", "why": "..."}], '
         '"thought": {"id": 0, "summary": "..."} | null, '
         '"research": {"id": 0, "summary": "...", "why": "..."} | null}\n\n'
         + json.dumps(payload, separators=(",", ":"))
@@ -501,7 +509,8 @@ def claude_curate(
         elif research_candidates:
             research = research_candidates[0]
             heuristic_text(research)
-        return top, leader, research
+        tldr = clean_text(reply.get("tldr")) if isinstance(reply.get("tldr"), str) else ""
+        return top, leader, research, tldr
     except Exception as exc:
         errors.append(f"Claude curation unavailable ({type(exc).__name__}); used heuristic fallback.")
         return fallback()
@@ -1362,6 +1371,103 @@ def mark_chart_featured(chart: dict[str, Any] | None) -> None:
     CHART_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+# Curated FRED series for the always-on "Chart of the Day" fallback. When none of
+# Orhan's own inputs (Walmart, Zillow, GDP/CPI, regional GDP-per-capita) have a
+# fresh update, the section is filled with a genuinely interesting market or
+# economic series built from REAL FRED data, chosen to match the day's headlines.
+# Numbers are never fabricated; if FRED is unreachable the section stays empty.
+FALLBACK_SERIES = [
+    {"keywords": ("stock", "equit", "s&p", "wall street", "nasdaq", "dow ", "rally", "sell-off", "selloff", "shares", "market"),
+     "series_id": "SP500", "chart_id": "fallback_sp500",
+     "title": "S&P 500 Index", "subtitle": "Daily close, last 2 years",
+     "caption": "The benchmark U.S. large-cap stock index.",
+     "source": "S&P Dow Jones Indices via FRED",
+     "source_url": "https://fred.stlouisfed.org/series/SP500",
+     "years_plotted": 2, "unit": "",
+     "explanation_template": "The S&P 500 closed at {latest} on {period}, {direction} from {previous} the prior session. It is the most widely watched gauge of U.S. equity performance."},
+    {"keywords": ("oil", "crude", "opec", "energy", "gasoline", "fuel", "barrel"),
+     "series_id": "DCOILWTICO", "chart_id": "fallback_wti",
+     "title": "WTI Crude Oil Price", "subtitle": "Daily spot price, USD per barrel, last 2 years",
+     "caption": "West Texas Intermediate crude, the U.S. oil benchmark.",
+     "source": "U.S. EIA via FRED",
+     "source_url": "https://fred.stlouisfed.org/series/DCOILWTICO",
+     "years_plotted": 2, "unit": "",
+     "explanation_template": "WTI crude settled near ${latest} per barrel on {period}, {direction} from ${previous} previously. Oil prices feed directly into fuel costs and headline inflation."},
+    {"keywords": ("treasury", "yield", "bond", "interest rate", "fed ", "federal reserve", "powell", "rate cut", "rate hike"),
+     "series_id": "DGS10", "chart_id": "fallback_dgs10",
+     "title": "10-Year U.S. Treasury Yield", "subtitle": "Daily market yield, last 2 years",
+     "caption": "The benchmark long-term U.S. interest rate.",
+     "source": "Federal Reserve Board via FRED",
+     "source_url": "https://fred.stlouisfed.org/series/DGS10",
+     "years_plotted": 2, "unit": "%",
+     "explanation_template": "The 10-year Treasury yield stood at {latest}% as of {period}, {direction} from {previous}% in the prior session. It anchors mortgage rates, borrowing costs, and equity valuations."},
+    {"keywords": ("job", "unemploy", "labor", "layoff", "hiring", "payroll", "wage"),
+     "series_id": "UNRATE", "chart_id": "fallback_unrate",
+     "title": "U.S. Unemployment Rate", "subtitle": "Monthly, last 10 years",
+     "caption": "The headline U.S. unemployment rate.",
+     "source": "U.S. Bureau of Labor Statistics via FRED",
+     "source_url": "https://fred.stlouisfed.org/series/UNRATE",
+     "years_plotted": 10, "unit": "%",
+     "explanation_template": "Unemployment was {latest}% in {period}, {direction} from {previous}% the month before. It is the most-watched single read on U.S. labor-market health."},
+    {"keywords": ("mortgage", "housing", "home price", "real estate", "homebuy", "rent"),
+     "series_id": "MORTGAGE30US", "chart_id": "fallback_mortgage",
+     "title": "30-Year Fixed Mortgage Rate", "subtitle": "Weekly average, last 5 years",
+     "caption": "The typical U.S. 30-year fixed mortgage rate.",
+     "source": "Freddie Mac via FRED",
+     "source_url": "https://fred.stlouisfed.org/series/MORTGAGE30US",
+     "years_plotted": 5, "unit": "%",
+     "explanation_template": "The average 30-year fixed mortgage rate was {latest}% in {period}, {direction} from {previous}% the prior week. It largely sets the cost of buying a home."},
+    {"keywords": ("bitcoin", "crypto", "btc", "ethereum", "coinbase", "digital asset"),
+     "series_id": "CBBTCUSD", "chart_id": "fallback_btc",
+     "title": "Bitcoin Price (USD)", "subtitle": "Daily, last 2 years",
+     "caption": "Bitcoin priced in U.S. dollars.",
+     "source": "Coinbase via FRED",
+     "source_url": "https://fred.stlouisfed.org/series/CBBTCUSD",
+     "years_plotted": 2, "unit": "",
+     "explanation_template": "Bitcoin traded near ${latest} on {period}, {direction} from ${previous} previously. It remains the bellwether for the broader crypto market."},
+    {"keywords": ("dollar", "currency", "forex", "exchange rate", "euro", "yen"),
+     "series_id": "DTWEXBGS", "chart_id": "fallback_dollar",
+     "title": "U.S. Dollar Index (Broad)", "subtitle": "Daily trade-weighted index, last 2 years",
+     "caption": "The broad trade-weighted value of the U.S. dollar.",
+     "source": "Federal Reserve Board via FRED",
+     "source_url": "https://fred.stlouisfed.org/series/DTWEXBGS",
+     "years_plotted": 2, "unit": "",
+     "explanation_template": "The broad dollar index was {latest} on {period}, {direction} from {previous} previously. A stronger dollar pressures exporters and dampens import costs."},
+]
+
+
+def news_fallback_chart(config: dict[str, Any], top_stories: list[Story],
+                        now: dt.datetime, errors: list[str]) -> dict[str, Any] | None:
+    """Always-on Chart of the Day: a real FRED series matched to today's news."""
+    text = " ".join(
+        f"{s.title} {s.summary or s.description or ''}" for s in top_stories
+    ).lower()
+    matched = [spec for spec in FALLBACK_SERIES
+               if any(k in text for k in spec["keywords"])]
+    # Unmatched series follow in a date-rotated order so quiet days still vary.
+    rot = now.timetuple().tm_yday % len(FALLBACK_SERIES)
+    rotated = FALLBACK_SERIES[rot:] + FALLBACK_SERIES[:rot]
+    ordered = matched + [spec for spec in rotated if spec not in matched]
+    for spec in ordered:
+        years = spec.get("years_plotted", 2)
+        try:
+            chart = build_fred_chart(
+                series_id=spec["series_id"], chart_id=spec["chart_id"],
+                title=spec["title"], subtitle=spec["subtitle"], caption=spec["caption"],
+                source=spec["source"], source_url=spec["source_url"], priority=5,
+                start=f"{now.year - (years + 2)}-01-01",
+                yoy_lag=0, years_plotted=years, unit=spec.get("unit", ""),
+                explanation_template=spec["explanation_template"],
+            )
+        except Exception as exc:
+            errors.append(f"Fallback chart {spec['series_id']}: {type(exc).__name__}")
+            chart = None
+        if chart:
+            chart["updated_at"] = now.astimezone(dt.timezone.utc).isoformat()
+            return chart
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -1432,7 +1538,7 @@ def section_html(title: str, content: str, empty_message: str = "") -> str:
 def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str, Any]],
            top: list[Story], leader_post: Story | None, leader_notes: list[str],
            research: list[Story], chart_of_day: dict[str, Any] | None,
-           errors: list[str]) -> str:
+           errors: list[str], tldr: str = "") -> str:
     date_label = (
         now.strftime("%B %-d, %Y, %A")
         if os.name != "nt"
@@ -1485,18 +1591,20 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
 
     chart_html = ""
     if chart_of_day:
-        updated = dt.datetime.fromisoformat(chart_of_day["updated_at"]).astimezone(
-            ZoneInfo(config["timezone"])
-        )
-        updated_label = updated.strftime("%B %#d, %Y") if os.name == "nt" else updated.strftime("%B %-d, %Y")
+        updated_label = ""
+        if chart_of_day.get("updated_at"):
+            updated = dt.datetime.fromisoformat(chart_of_day["updated_at"]).astimezone(
+                ZoneInfo(config["timezone"])
+            )
+            updated_label = updated.strftime("%B %#d, %Y") if os.name == "nt" else updated.strftime("%B %-d, %Y")
         chart_html = f'''
           <h3>{esc(chart_of_day["title"])}</h3>
           <p align="center"><img src="cid:chart-of-the-day" width="600" style="max-width:100%;height:auto"
              alt="{esc(chart_of_day["title"])}"></p>
-          <p>{esc(chart_of_day.get("explanation") or chart_of_day["caption"])}</p>
+          <p>{esc(chart_of_day.get("explanation") or chart_of_day.get("caption") or "")}</p>
           <p><small><strong>Source:</strong> {esc(chart_of_day["source"])}
           {f'· <a href="{esc(chart_of_day["source_url"])}">View source</a>' if chart_of_day.get("source_url") else ''}
-          · Updated {esc(updated_label)}</small></p>'''
+          {f"· Updated {esc(updated_label)}" if updated_label else ""}</small></p>'''
 
     return f"""<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -1529,6 +1637,13 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       {weather_table}
 
       <h2>Good morning</h2>
+      {f'''<table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#EDE6D6">
+      <tr><td>
+        <font face="Georgia, Times New Roman, serif" color="#17324D" size="3">
+          <strong>TODAY'S TAKEAWAY &nbsp;</strong>{esc(tldr)}
+        </font>
+      </td></tr>
+      </table>''' if tldr else ''}
 
       {section_html("1 · Top News", top_html, "No qualifying stories were available in this run.")}
       {section_html("2 · Research Radar", research_html, "No qualifying research items were available in this run.")}
@@ -1571,7 +1686,12 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
     msg["Subject"] = subject
     msg.set_content(f"{name} is best viewed as HTML.")
     msg.add_alternative(body, subtype="html")
-    chart = select_chart_of_the_day(config)
+    chart = None
+    try:
+        saved = json.loads((OUTPUT / "latest.json").read_text(encoding="utf-8"))
+        chart = saved.get("chart_of_the_day")
+    except (OSError, json.JSONDecodeError):
+        chart = select_chart_of_the_day(config)
     if chart and "cid:chart-of-the-day" in body:
         image_path = Path(chart["image_path"])
         subtype = image_path.suffix.lower().lstrip(".")
@@ -1588,7 +1708,8 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as smtp:
         smtp.login(user, password)
         smtp.send_message(msg, to_addrs=recipients)
-    if os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}:
+    if (os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}
+            and chart and chart.get("updated_mtime")):
         mark_chart_featured(chart)
 
 
@@ -1626,6 +1747,11 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         + select_diverse(ft_items + economist_items, 6, per_category=3, per_source=2)
     )
     news_candidates.sort(key=lambda x: x.score, reverse=True)
+    seen_links = load_seen_links()
+    if seen_links:
+        filtered = [s for s in news_candidates if s.link not in seen_links]
+        if filtered:
+            news_candidates = filtered
     research_candidates = select_diverse(research_pool, 10, per_category=4, per_source=2)
     for item in research_candidates:
         item.kind = "research"
@@ -1633,7 +1759,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
 
     if no_ai:
         os.environ.pop("ANTHROPIC_API_KEY", None)
-    top, leader_post, research_pick = claude_curate(
+    top, leader_post, research_pick, tldr = claude_curate(
         news_candidates, leader_candidates, research_candidates, config, errors,
     )
     research_items = [research_pick] if research_pick else []
@@ -1643,8 +1769,10 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         top = top[:6 - (1 if leader_post else 0)]
 
     chart_of_day = select_chart_of_the_day(config, now)
+    if not chart_of_day:
+        chart_of_day = news_fallback_chart(config, top, now, errors)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
-                  research_items, chart_of_day, errors)
+                  research_items, chart_of_day, errors, tldr)
     OUTPUT.mkdir(exist_ok=True)
     dated = OUTPUT / f"omi_{now:%Y-%m-%d}.html"
     latest = OUTPUT / "latest.html"
@@ -1670,11 +1798,16 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         if os.name == "nt"
         else now.strftime("%B %-d, %Y")
     )
-    return dated, f"{config['newsletter_name']} | {date_label}", manifest
+    lead = top[0].title if top else (tldr or "")
+    lead = re.sub(r"\s+-\s+[^-]{2,40}$", "", lead).strip()
+    if len(lead) > 78:
+        lead = lead[:75].rstrip() + "..."
+    subject = f"{config['newsletter_name']}: {lead}" if lead else f"{config['newsletter_name']} | {date_label}"
+    return dated, subject, manifest
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Times.")
+    parser = argparse.ArgumentParser(description="Generate and deliver the daily newsletter.")
     parser.add_argument("--no-send", action="store_true", help="Generate files without sending email.")
     parser.add_argument("--no-ai", action="store_true", help="Use feed descriptions instead of Claude summaries.")
     args = parser.parse_args()
@@ -1690,6 +1823,8 @@ def main() -> int:
     if not args.no_send:
         send_email(load_config(), subject, body)
         print("Email sent.")
+        if os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}:
+            record_seen_links([s.get("link", "") for s in manifest.get("stories", [])])
     return 0
 
 

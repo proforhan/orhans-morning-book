@@ -22,19 +22,39 @@
     "title": "Texas Home Prices: Selected Cities",
     "source_url": "https://www.zillow.com/research/data/",
     "state": "TX",
-    "cities": ["Dallas", "Frisco", "Irving", "Plano"],
+    "cities": [
+      "Dallas",
+      "Frisco",
+      "Irving",
+      "Plano"
+    ],
     "years": 10,
     "priority": 15
   },
   "gdp_per_capita": {
     "enabled": true,
     "indicator": "NY.GDP.PCAP.CD",
-    "regions": ["World", "Africa", "Asia", "Europe", "Americas", "Oceania"],
+    "regions": [
+      "World",
+      "Africa",
+      "Asia",
+      "Europe",
+      "Americas",
+      "Oceania"
+    ],
     "priority": 5
   },
   "weather_locations": [
-    { "city": "Irving, TX", "latitude": 32.814, "longitude": -96.9489 },
-    { "city": "Dallas, TX", "latitude": 32.7767, "longitude": -96.797 }
+    {
+      "city": "Irving, TX",
+      "latitude": 32.814,
+      "longitude": -96.9489
+    },
+    {
+      "city": "Dallas, TX",
+      "latitude": 32.7767,
+      "longitude": -96.797
+    }
   ],
   "chart_sources": [
     {
@@ -77,18 +97,6 @@
         "https://www.cfr.org/blog/setser/feed"
       ],
       "news_query": "\"Brad Setser\" when:2d"
-    },
-    {
-      "name": "Mark Zandi",
-      "handle": "@Markzandi",
-      "url": "https://x.com/Markzandi",
-      "feeds": [],
-      "news_query": "\"Mark Zandi\" when:2d"
     }
-  ],
-  "nitter_instances": [
-    "https://nitter.net",
-    "https://nitter.poast.org",
-    "https://nitter.privacyredirect.com"
   ]
 }
