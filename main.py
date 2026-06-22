@@ -285,8 +285,15 @@ def category(story: Story) -> str:
         return "economics"
     if any(x in text for x in ("world cup", "football", "soccer", "fifa")):
         return "football"
-    if any(x in text for x in ("artificial intelligence", " ai ", "machine learning", "llm")):
+    if any(x in text for x in ("artificial intelligence", " ai ", " ai.", " ai,",
+                               "machine learning", "llm", "openai", "anthropic",
+                               "chatgpt", "gpt-", "gemini", "nvidia", "chatbot",
+                               "generative ai", "neural network", "deepmind")):
         return "ai"
+    if any(x in text for x in ("election", "congress", "senate", "white house",
+                               "president", "parliament", "government", "policy",
+                               "diplomat", "sanction")):
+        return "politics"
     if any(x in text for x in ("research", "science", "study", "arxiv")):
         return "science"
     return "world-tech"
@@ -1621,7 +1628,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
           <strong>{esc(config['newsletter_name'])}</strong>
         </font><br>
         <font face="Arial, sans-serif" color="#DDE7EF" size="2">
-          <strong>{esc(date_label)} &nbsp;·&nbsp; MORNING EDITION</strong>
+          <strong>{esc(date_label)}</strong>
         </font>
       </td></tr>
       </table>
@@ -1747,6 +1754,18 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         + select_diverse(ft_items + economist_items, 6, per_category=3, per_source=2)
     )
     news_candidates.sort(key=lambda x: x.score, reverse=True)
+    # Hard-cap AI in the candidate pool so the editor receives a diverse slate
+    # and cannot be forced into AI dominance by the available candidates.
+    ai_cap = 3
+    capped: list[Story] = []
+    ai_seen = 0
+    for story in news_candidates:
+        if category(story) == "ai":
+            if ai_seen >= ai_cap:
+                continue
+            ai_seen += 1
+        capped.append(story)
+    news_candidates = capped
     seen_links = load_seen_links()
     if seen_links:
         filtered = [s for s in news_candidates if s.link not in seen_links]
