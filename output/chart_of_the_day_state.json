@@ -10,15 +10,16 @@
     "featured_signature": "6088ec61f67d301db2e3ab112f0780586d8e5c2e8111a3fc676009ce03a21c93"
   },
   "gdp_per_capita": {
-    "featured_mtime": 1782126116.627115,
-    "featured_at": "2026-06-22T11:01:58.431185+00:00",
-    "featured_signature": "c402bd14cf20a18a32c2c9576d91e566fb92440fc0f3f763cf65a38471866cc1",
+    "featured_mtime": 1782212505.019554,
+    "featured_at": "2026-06-23T11:01:52.182808+00:00",
+    "featured_signature": "9ddc334af2bb29eb0409af3be72494ce5081df9956167c7156d02e4baf21045c",
     "quarter": "2026-Q2",
     "shown": [
       "World",
       "Africa",
       "Asia",
-      "Europe"
+      "Europe",
+      "Americas"
     ]
   }
 }
