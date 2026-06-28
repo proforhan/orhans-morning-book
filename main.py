@@ -288,8 +288,10 @@ def category(story: Story) -> str:
     if any(x in text for x in ("artificial intelligence", " ai ", " ai.", " ai,",
                                "machine learning", "llm", "openai", "anthropic",
                                "chatgpt", "gpt-", "gemini", "nvidia", "chatbot",
-                               "generative ai", "neural network", "deepmind")):
-        return "ai"
+                               "generative ai", "neural network", "deepmind",
+                               "technology", "software", "semiconductor", "chip",
+                               "microsoft", "google", "apple", "meta", "amazon")):
+        return "tech"
     if any(x in text for x in ("election", "congress", "senate", "white house",
                                "president", "parliament", "government", "policy",
                                "diplomat", "sanction")):
@@ -766,6 +768,85 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
     }
 
 
+
+
+def build_global_inflation_chart(now: dt.datetime) -> dict[str, Any] | None:
+    """Build a line chart of World Bank global CPI inflation (annual %)."""
+    chart_id = "worldbank_global_inflation"
+    chart_path = OUTPUT / f"{chart_id}.png"
+    metadata_path = OUTPUT / f"{chart_id}.json"
+    indicator = "FP.CPI.TOTL.ZG"
+    # World Bank aggregate code for World is "WLD"
+    url = (
+        f"https://api.worldbank.org/v2/country/WLD/indicator/{indicator}"
+        f"?format=json&date=2000:2025&per_page=30"
+    )
+    try:
+        raw = json.loads(fetch(url, timeout=40))
+    except Exception:
+        return None
+    if not isinstance(raw, list) or len(raw) < 2 or not raw[1]:
+        return None
+    series: list[tuple[dt.date, float]] = []
+    for entry in raw[1]:
+        if entry.get("value") is None:
+            continue
+        try:
+            year = int(entry["date"])
+            series.append((dt.date(year, 12, 31), float(entry["value"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    series.sort(key=lambda x: x[0])
+    if len(series) < 5:
+        return None
+    latest_date, latest_value = series[-1]
+    previous_value = series[-2][1]
+    cutoff = dt.date(now.year - 10, 1, 1)
+    plotted = [(d, v) for d, v in series if d >= cutoff]
+    sig = hashlib.sha256(json.dumps(
+        [(d.isoformat(), round(v, 3)) for d, v in series], separators=(",", ":")
+    ).encode()).hexdigest()
+    old_meta: dict[str, Any] = {}
+    if metadata_path.exists():
+        try:
+            old_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if old_meta.get("data_signature") != sig or not chart_path.exists():
+        draw_line_chart(
+            chart_path, plotted,
+            "Global Inflation Rate",
+            "World average CPI inflation, annual %, last 10 years",
+            "Source: World Bank (FP.CPI.TOTL.ZG)",
+        )
+        metadata_path.write_text(json.dumps({
+            "latest_date": latest_date.isoformat(),
+            "latest_value": round(latest_value, 2),
+            "previous_value": round(previous_value, 2),
+            "data_signature": sig,
+        }, indent=2), encoding="utf-8")
+    direction = "rose" if latest_value > previous_value else "eased" if latest_value < previous_value else "held steady"
+    explanation = (
+        f"Global consumer price inflation {direction} to {latest_value:.1f}% in {latest_date.year}, "
+        f"from {previous_value:.1f}% the year before, according to the World Bank. "
+        f"The series aggregates inflation across more than 190 countries, weighting by GDP."
+    )
+    return {
+        "id": chart_id,
+        "title": "Global Inflation Rate",
+        "image_path": str(chart_path),
+        "trigger_path": str(metadata_path),
+        "caption": "World average CPI inflation (annual %), World Bank.",
+        "explanation": explanation,
+        "source": "World Bank",
+        "source_url": "https://data.worldbank.org/indicator/FP.CPI.TOTL.ZG",
+        "priority": 8,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "updated_mtime": metadata_path.stat().st_mtime if metadata_path.exists() else 0,
+        "image_mtime": chart_path.stat().st_mtime if chart_path.exists() else 0,
+    }
+
+
 def fred_chart_sources() -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     builders = [
@@ -810,6 +891,12 @@ def fred_chart_sources() -> list[dict[str, Any]]:
                 sources.append(built)
         except Exception:
             continue
+    try:
+        global_infl = build_global_inflation_chart(dt.datetime.now(dt.timezone.utc))
+        if global_infl:
+            sources.append(global_infl)
+    except Exception:
+        pass
     return sources
 
 
@@ -1384,6 +1471,14 @@ def mark_chart_featured(chart: dict[str, Any] | None) -> None:
 # economic series built from REAL FRED data, chosen to match the day's headlines.
 # Numbers are never fabricated; if FRED is unreachable the section stays empty.
 FALLBACK_SERIES = [
+    {"keywords": ("global inflation", "world inflation", "global cpi", "imf inflation",
+                  "worldwide inflation", "international inflation"),
+     "series_id": "GLOBAL_INFL", "chart_id": "worldbank_global_inflation",
+     "title": "Global Inflation Rate", "subtitle": "World average CPI inflation, annual %, last 10 years",
+     "caption": "World average CPI inflation (annual %), World Bank.",
+     "source": "World Bank", "source_url": "https://data.worldbank.org/indicator/FP.CPI.TOTL.ZG",
+     "years_plotted": 10, "unit": "%",
+     "explanation_template": "Global CPI inflation stood at {latest}% in the latest year, {direction} from {previous}% previously. The World Bank series aggregates price growth across more than 190 economies."},
     {"keywords": ("stock", "equit", "s&p", "wall street", "nasdaq", "dow ", "rally", "sell-off", "selloff", "shares", "market"),
      "series_id": "SP500", "chart_id": "fallback_sp500",
      "title": "S&P 500 Index", "subtitle": "Daily close, last 2 years",
@@ -1443,6 +1538,93 @@ FALLBACK_SERIES = [
 ]
 
 
+def web_search_chart_fallback(top_stories: list[Story],
+                              now: dt.datetime, errors: list[str]) -> dict[str, Any] | None:
+    """Last-resort chart: query Google News RSS to discover today's dominant topic,
+    then map it to a real FRED or World Bank series.  Numbers are never fabricated.
+    Returns None only if FRED is genuinely unreachable."""
+    # Build a query from the top headlines to find what's dominating today
+    headline_words = " ".join(s.title for s in top_stories[:6]).lower()
+    # Map topic signals to FRED series (same pool as FALLBACK_SERIES but driven by
+    # a fresh RSS search rather than the already-curated top list)
+    topic_map = [
+        (("inflation", "cpi", "price", "cost of living"), "CPIAUCSL", "fred_cpi_inflation",
+         "U.S. CPI Inflation", "Year-over-year CPI change, monthly, last 10 years",
+         "Year-over-year consumer price inflation in the United States.",
+         "U.S. Bureau of Labor Statistics via FRED",
+         "https://fred.stlouisfed.org/series/CPIAUCSL",
+         10, 12, "%",
+         "Consumer prices were {latest}% above a year earlier in {period}; inflation {direction} from {previous}%."),
+        (("unemployment", "jobs", "labor", "layoff", "hiring"), "UNRATE", "fallback_unrate",
+         "U.S. Unemployment Rate", "Monthly, last 10 years",
+         "The headline U.S. unemployment rate.",
+         "U.S. Bureau of Labor Statistics via FRED",
+         "https://fred.stlouisfed.org/series/UNRATE",
+         10, 0, "%",
+         "Unemployment was {latest}% in {period}, {direction} from {previous}% the month before."),
+        (("mortgage", "housing", "home price"), "MORTGAGE30US", "fallback_mortgage",
+         "30-Year Fixed Mortgage Rate", "Weekly average, last 5 years",
+         "The average U.S. 30-year fixed mortgage rate.",
+         "Freddie Mac via FRED",
+         "https://fred.stlouisfed.org/series/MORTGAGE30US",
+         5, 0, "%",
+         "The 30-year mortgage rate was {latest}% in {period}, {direction} from {previous}%."),
+        (("oil", "crude", "opec", "energy"), "DCOILWTICO", "fallback_wti",
+         "WTI Crude Oil Price", "Daily spot price USD/barrel, last 2 years",
+         "West Texas Intermediate crude — the U.S. oil benchmark.",
+         "U.S. EIA via FRED",
+         "https://fred.stlouisfed.org/series/DCOILWTICO",
+         2, 0, "",
+         "WTI crude settled near ${latest}/barrel on {period}, {direction} from ${previous}."),
+    ]
+    # Try to fetch a fresh RSS signal to supplement the top-stories text
+    search_text = headline_words
+    try:
+        query = urllib.parse.quote("economics finance markets today when:1d")
+        rss_stories = parse_feed("Google News", f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en")
+        search_text = headline_words + " " + " ".join(s.title for s in rss_stories[:8]).lower()
+    except Exception:
+        pass
+    # Pick the best-matching series
+    for keywords, series_id, chart_id, title, subtitle, caption, source, source_url, years, yoy_lag, unit, tmpl in topic_map:
+        if any(k in search_text for k in keywords):
+            try:
+                chart = build_fred_chart(
+                    series_id=series_id, chart_id=chart_id,
+                    title=title, subtitle=subtitle, caption=caption,
+                    source=source, source_url=source_url, priority=3,
+                    start=f"{now.year - (years + 2)}-01-01",
+                    yoy_lag=yoy_lag, years_plotted=years, unit=unit,
+                    explanation_template=tmpl,
+                )
+                if chart:
+                    chart["updated_at"] = now.astimezone(dt.timezone.utc).isoformat()
+                    return chart
+            except Exception as exc:
+                errors.append(f"Web-search chart fallback ({series_id}): {type(exc).__name__}")
+    # Absolute last resort: 10-year Treasury (most stable FRED series)
+    try:
+        chart = build_fred_chart(
+            series_id="DGS10", chart_id="fallback_dgs10_last",
+            title="10-Year U.S. Treasury Yield", subtitle="Daily market yield, last 2 years",
+            caption="The benchmark long-term U.S. interest rate.",
+            source="Federal Reserve Board via FRED",
+            source_url="https://fred.stlouisfed.org/series/DGS10",
+            priority=1, start=f"{now.year - 4}-01-01",
+            yoy_lag=0, years_plotted=2, unit="%",
+            explanation_template=(
+                "The 10-year Treasury yield stood at {latest}% as of {period}, "
+                "{direction} from {previous}% the prior session."
+            ),
+        )
+        if chart:
+            chart["updated_at"] = now.astimezone(dt.timezone.utc).isoformat()
+            return chart
+    except Exception as exc:
+        errors.append(f"Last-resort Treasury chart: {type(exc).__name__}")
+    return None
+
+
 def news_fallback_chart(config: dict[str, Any], top_stories: list[Story],
                         now: dt.datetime, errors: list[str]) -> dict[str, Any] | None:
     """Always-on Chart of the Day: a real FRED series matched to today's news."""
@@ -1458,14 +1640,17 @@ def news_fallback_chart(config: dict[str, Any], top_stories: list[Story],
     for spec in ordered:
         years = spec.get("years_plotted", 2)
         try:
-            chart = build_fred_chart(
-                series_id=spec["series_id"], chart_id=spec["chart_id"],
-                title=spec["title"], subtitle=spec["subtitle"], caption=spec["caption"],
-                source=spec["source"], source_url=spec["source_url"], priority=5,
-                start=f"{now.year - (years + 2)}-01-01",
-                yoy_lag=0, years_plotted=years, unit=spec.get("unit", ""),
-                explanation_template=spec["explanation_template"],
-            )
+            if spec["series_id"] == "GLOBAL_INFL":
+                chart = build_global_inflation_chart(now)
+            else:
+                chart = build_fred_chart(
+                    series_id=spec["series_id"], chart_id=spec["chart_id"],
+                    title=spec["title"], subtitle=spec["subtitle"], caption=spec["caption"],
+                    source=spec["source"], source_url=spec["source_url"], priority=5,
+                    start=f"{now.year - (years + 2)}-01-01",
+                    yoy_lag=0, years_plotted=years, unit=spec.get("unit", ""),
+                    explanation_template=spec["explanation_template"],
+                )
         except Exception as exc:
             errors.append(f"Fallback chart {spec['series_id']}: {type(exc).__name__}")
             chart = None
@@ -1760,7 +1945,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     capped: list[Story] = []
     ai_seen = 0
     for story in news_candidates:
-        if category(story) == "ai":
+        if category(story) == "tech":
             if ai_seen >= ai_cap:
                 continue
             ai_seen += 1
@@ -1790,6 +1975,8 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     chart_of_day = select_chart_of_the_day(config, now)
     if not chart_of_day:
         chart_of_day = news_fallback_chart(config, top, now, errors)
+    if not chart_of_day:
+        chart_of_day = web_search_chart_fallback(top, now, errors)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
                   research_items, chart_of_day, errors, tldr)
     OUTPUT.mkdir(exist_ok=True)
@@ -1817,11 +2004,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         if os.name == "nt"
         else now.strftime("%B %-d, %Y")
     )
-    lead = top[0].title if top else (tldr or "")
-    lead = re.sub(r"\s+-\s+[^-]{2,40}$", "", lead).strip()
-    if len(lead) > 78:
-        lead = lead[:75].rstrip() + "..."
-    subject = f"{config['newsletter_name']}: {lead}" if lead else f"{config['newsletter_name']} | {date_label}"
+    subject = f"{config['newsletter_name']} | {date_label}"
     return dated, subject, manifest
 
 
