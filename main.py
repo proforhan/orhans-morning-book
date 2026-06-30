@@ -318,6 +318,48 @@ def select_diverse(stories: list[Story], limit: int, per_category: int = 3,
     return selected
 
 
+# Categories that must appear at least once in the final Top News selection
+# when a qualifying candidate exists, mirroring the AI/tech hard cap above but
+# as a floor instead of a ceiling. Both topics tend to be under-weighted by
+# TOPIC_WEIGHTS and actively discouraged by the curation prompt's "avoid
+# low-impact political commentary" guidance, so they need an explicit backstop
+# or they can vanish from the newsletter entirely on a given day.
+FLOOR_CATEGORIES = ("politics", "football")
+
+
+def enforce_category_floor(top: list[Story], pool: list[Story]) -> list[Story]:
+    """Guarantee at least one story per FLOOR_CATEGORIES in `top`.
+
+    If Claude's curation (or the heuristic fallback) didn't already include a
+    qualifying item, the best-scoring eligible candidate is pulled from `pool`
+    (the same candidate set the editor saw) and swapped in for the
+    lowest-scoring item that isn't itself filling another floor slot. Categories
+    with no eligible candidate in `pool` at all are left alone -- the floor
+    never invents coverage that doesn't exist that day.
+    """
+    result = list(top)
+    used_links = {s.link for s in result}
+    for cat in FLOOR_CATEGORIES:
+        if any(category(s) == cat for s in result):
+            continue
+        candidate = next(
+            (s for s in sorted(pool, key=lambda x: x.score, reverse=True)
+             if category(s) == cat and s.link not in used_links),
+            None,
+        )
+        if candidate is None:
+            continue
+        heuristic_text(candidate)
+        evictable = [i for i, s in enumerate(result) if category(s) not in FLOOR_CATEGORIES]
+        if not evictable:
+            result.append(candidate)
+        else:
+            worst = min(evictable, key=lambda i: result[i].score)
+            result[worst] = candidate
+        used_links.add(candidate.link)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Thought Leaders Monitor
 # ---------------------------------------------------------------------------
@@ -475,7 +517,7 @@ def claude_curate(
         "medicine. Avoid celebrity news, entertainment, low-impact political commentary, "
         "investment-promotion content, and duplicate coverage of the same underlying story.\n\n"
         f"From news_candidates choose exactly {top_n} items (fewer only if the pool is smaller), "
-        "ordered most consequential first. Deliberately spread coverage across topics: include no more than 2 AI/tech items, and make sure economics/finance, medicine/health, and academic research each appear when qualifying candidates exist. For each "
+        "ordered most consequential first. Deliberately spread coverage across topics: include no more than 2 AI/tech items, and make sure economics/finance, medicine/health, and academic research each appear when qualifying candidates exist. Also include at least one substantive politics/government/policy item and one football/World Cup item whenever a qualifying candidate exists -- 'substantive' means real policy, elections, or major geopolitical developments, not gossip or opinion-column speculation. For each "
         "write 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
         "no hype, no invented facts) and 'why' (one short sentence on why it matters to this "
         "reader).\n\n"
@@ -771,40 +813,51 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
 
 
 def build_global_inflation_chart(now: dt.datetime) -> dict[str, Any] | None:
-    """Build a line chart of World Bank global CPI inflation (annual %)."""
-    chart_id = "worldbank_global_inflation"
+    """Compare year-over-year CPI inflation across major economies, monthly.
+
+    Pulls monthly consumer-price index levels for the U.S., euro area, and
+    UK from FRED (all reported monthly, unlike the World Bank's annual
+    aggregate), derives year-over-year inflation for each, and plots them
+    together so the reader can see how price pressure compares across
+    regions month to month. Any single country's data being unavailable
+    just drops that line; the chart still renders as long as at least two
+    economies have usable data, so a temporary outage at one source doesn't
+    blank the whole section.
+    """
+    chart_id = "global_inflation_comparison"
     chart_path = OUTPUT / f"{chart_id}.png"
     metadata_path = OUTPUT / f"{chart_id}.json"
-    indicator = "FP.CPI.TOTL.ZG"
-    # World Bank aggregate code for World is "WLD"
-    url = (
-        f"https://api.worldbank.org/v2/country/WLD/indicator/{indicator}"
-        f"?format=json&date=2000:2025&per_page=30"
-    )
-    try:
-        raw = json.loads(fetch(url, timeout=40))
-    except Exception:
-        return None
-    if not isinstance(raw, list) or len(raw) < 2 or not raw[1]:
-        return None
-    series: list[tuple[dt.date, float]] = []
-    for entry in raw[1]:
-        if entry.get("value") is None:
-            continue
+    start = f"{now.year - 12}-01-01"
+    plot_cutoff = dt.date(now.year - 5, 1, 1)
+    countries = [
+        ("United States", "CPIAUCSL"),
+        ("Euro Area", "CP0000EZ19M086NEST"),
+        ("United Kingdom", "GBRCPIALLMINMEI"),
+    ]
+    lines: list[tuple[str, list[tuple[dt.date, float]]]] = []
+    latest_by_country: dict[str, tuple[dt.date, float, float]] = {}
+    for name, series_id in countries:
         try:
-            year = int(entry["date"])
-            series.append((dt.date(year, 12, 31), float(entry["value"])))
-        except (KeyError, TypeError, ValueError):
+            observations = fred_observations(series_id, start)
+        except Exception:
             continue
-    series.sort(key=lambda x: x[0])
-    if len(series) < 5:
+        if len(observations) < 13:
+            continue
+        yoy = [
+            (observations[i][0], (observations[i][1] / observations[i - 12][1] - 1) * 100)
+            for i in range(12, len(observations))
+        ]
+        recent_points = [(d, v) for d, v in yoy if d >= plot_cutoff]
+        if len(recent_points) < 6:
+            continue
+        lines.append((name, recent_points))
+        latest_by_country[name] = (recent_points[-1][0], recent_points[-1][1], recent_points[-2][1])
+    if len(lines) < 2:
         return None
-    latest_date, latest_value = series[-1]
-    previous_value = series[-2][1]
-    cutoff = dt.date(now.year - 10, 1, 1)
-    plotted = [(d, v) for d, v in series if d >= cutoff]
+
     sig = hashlib.sha256(json.dumps(
-        [(d.isoformat(), round(v, 3)) for d, v in series], separators=(",", ":")
+        {name: [(d.isoformat(), round(v, 3)) for d, v in pts] for name, pts in lines},
+        separators=(",", ":"),
     ).encode()).hexdigest()
     old_meta: dict[str, Any] = {}
     if metadata_path.exists():
@@ -813,33 +866,34 @@ def build_global_inflation_chart(now: dt.datetime) -> dict[str, Any] | None:
         except (OSError, json.JSONDecodeError):
             pass
     if old_meta.get("data_signature") != sig or not chart_path.exists():
-        draw_line_chart(
-            chart_path, plotted,
-            "Global Inflation Rate",
-            "World average CPI inflation, annual %, last 10 years",
-            "Source: World Bank (FP.CPI.TOTL.ZG)",
+        draw_multi_line_chart(
+            chart_path, lines,
+            title="Global Inflation Comparison",
+            subtitle="Year-over-year CPI inflation, monthly, last 5 years",
+            footer="Source: FRED (BLS, Eurostat, OECD)",
+            unit="%",
         )
-        metadata_path.write_text(json.dumps({
-            "latest_date": latest_date.isoformat(),
-            "latest_value": round(latest_value, 2),
-            "previous_value": round(previous_value, 2),
-            "data_signature": sig,
-        }, indent=2), encoding="utf-8")
-    direction = "rose" if latest_value > previous_value else "eased" if latest_value < previous_value else "held steady"
+        metadata_path.write_text(json.dumps({"data_signature": sig}, indent=2), encoding="utf-8")
+
+    latest_label = max(d for d, _, _ in latest_by_country.values()).strftime("%B %Y")
+    parts = []
+    for name, (_, latest, previous) in sorted(latest_by_country.items(), key=lambda kv: -kv[1][1]):
+        direction = "up" if latest > previous else "down" if latest < previous else "flat"
+        parts.append(f"{name} {latest:.1f}% ({direction} from {previous:.1f}%)")
     explanation = (
-        f"Global consumer price inflation {direction} to {latest_value:.1f}% in {latest_date.year}, "
-        f"from {previous_value:.1f}% the year before, according to the World Bank. "
-        f"The series aggregates inflation across more than 190 countries, weighting by GDP."
+        f"Year-over-year consumer price inflation as of {latest_label}: " + "; ".join(parts) + ". "
+        "Each line is computed directly from national statistical offices' monthly CPI/HICP levels via FRED, "
+        "so the comparison updates every month rather than once a year."
     )
     return {
         "id": chart_id,
-        "title": "Global Inflation Rate",
+        "title": "Global Inflation Comparison",
         "image_path": str(chart_path),
         "trigger_path": str(metadata_path),
-        "caption": "World average CPI inflation (annual %), World Bank.",
+        "caption": "Year-over-year CPI inflation across major economies, monthly.",
         "explanation": explanation,
-        "source": "World Bank",
-        "source_url": "https://data.worldbank.org/indicator/FP.CPI.TOTL.ZG",
+        "source": "FRED (national statistical offices)",
+        "source_url": "https://fred.stlouisfed.org/release?rid=251",
         "priority": 8,
         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "updated_mtime": metadata_path.stat().st_mtime if metadata_path.exists() else 0,
@@ -1473,19 +1527,19 @@ def mark_chart_featured(chart: dict[str, Any] | None) -> None:
 FALLBACK_SERIES = [
     {"keywords": ("global inflation", "world inflation", "global cpi", "imf inflation",
                   "worldwide inflation", "international inflation"),
-     "series_id": "GLOBAL_INFL", "chart_id": "worldbank_global_inflation",
-     "title": "Global Inflation Rate", "subtitle": "World average CPI inflation, annual %, last 10 years",
-     "caption": "World average CPI inflation (annual %), World Bank.",
-     "source": "World Bank", "source_url": "https://data.worldbank.org/indicator/FP.CPI.TOTL.ZG",
-     "years_plotted": 10, "unit": "%",
-     "explanation_template": "Global CPI inflation stood at {latest}% in the latest year, {direction} from {previous}% previously. The World Bank series aggregates price growth across more than 190 economies."},
+     "series_id": "GLOBAL_INFL", "chart_id": "global_inflation_comparison",
+     "title": "Global Inflation Comparison", "subtitle": "Year-over-year CPI inflation, monthly, last 5 years",
+     "caption": "Year-over-year CPI inflation across major economies, monthly.",
+     "source": "FRED (national statistical offices)", "source_url": "https://fred.stlouisfed.org/release?rid=251",
+     "years_plotted": 5, "unit": "%",
+     "explanation_template": "Year-over-year CPI inflation compared across major economies, updated monthly from FRED."},
     {"keywords": ("stock", "equit", "s&p", "wall street", "nasdaq", "dow ", "rally", "sell-off", "selloff", "shares", "market"),
-     "series_id": "SP500", "chart_id": "fallback_sp500",
-     "title": "S&P 500 Index", "subtitle": "Daily close, last 2 years",
+     "series_id": "SP500", "chart_id": "fallback_sp500_1m",
+     "title": "S&P 500 Index", "subtitle": "Daily close, trailing month",
      "caption": "The benchmark U.S. large-cap stock index.",
      "source": "S&P Dow Jones Indices via FRED",
      "source_url": "https://fred.stlouisfed.org/series/SP500",
-     "years_plotted": 2, "unit": "",
+     "years_plotted": 0, "unit": "",
      "explanation_template": "The S&P 500 closed at {latest} on {period}, {direction} from {previous} the prior session. It is the most widely watched gauge of U.S. equity performance."},
     {"keywords": ("oil", "crude", "opec", "energy", "gasoline", "fuel", "barrel"),
      "series_id": "DCOILWTICO", "chart_id": "fallback_wti",
@@ -1536,6 +1590,71 @@ FALLBACK_SERIES = [
      "years_plotted": 2, "unit": "",
      "explanation_template": "The broad dollar index was {latest} on {period}, {direction} from {previous} previously. A stronger dollar pressures exporters and dampens import costs."},
 ]
+
+
+def build_sp500_one_month_chart(now: dt.datetime) -> dict[str, Any] | None:
+    """Always-on equity fallback: S&P 500 daily close over the trailing month.
+
+    This is the guaranteed final chart when nothing else (Walmart, Zillow,
+    FRED official series, GDP-per-capita rotation, or a news-matched fallback)
+    is available, so Chart of the Day is never blank. Equities trade nearly
+    every weekday, which makes this a reliably fresh series to fall back on.
+    """
+    chart_id = "fallback_sp500_1m"
+    chart_path = OUTPUT / f"{chart_id}.png"
+    metadata_path = OUTPUT / f"{chart_id}.json"
+    start = (now.date() - dt.timedelta(days=45)).isoformat()
+    try:
+        observations = fred_observations("SP500", start)
+    except Exception:
+        return None
+    if len(observations) < 3:
+        return None
+    cutoff = now.date() - dt.timedelta(days=30)
+    plotted = [(d, v) for d, v in observations if d >= cutoff]
+    if len(plotted) < 3:
+        plotted = observations[-15:]
+    latest_date, latest_value = plotted[-1]
+    previous_value = plotted[-2][1]
+    sig = hashlib.sha256(json.dumps(
+        [(d.isoformat(), round(v, 2)) for d, v in plotted], separators=(",", ":"),
+    ).encode()).hexdigest()
+    old_meta: dict[str, Any] = {}
+    if metadata_path.exists():
+        try:
+            old_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if old_meta.get("data_signature") != sig or not chart_path.exists():
+        draw_line_chart(
+            chart_path, plotted,
+            "S&P 500 Index",
+            "Daily close, trailing month",
+            "Source: S&P Dow Jones Indices via FRED",
+            unit="",
+        )
+        metadata_path.write_text(json.dumps({"data_signature": sig}, indent=2), encoding="utf-8")
+    direction = "up" if latest_value > previous_value else "down" if latest_value < previous_value else "flat"
+    period = latest_date.strftime("%B %#d, %Y" if os.name == "nt" else "%B %-d, %Y")
+    explanation = (
+        f"The S&P 500 closed at {latest_value:,.0f} on {period}, {direction} from "
+        f"{previous_value:,.0f} the prior session. It is the most widely watched gauge of "
+        "U.S. equity performance, shown here as the trailing month."
+    )
+    return {
+        "id": chart_id,
+        "title": "S&P 500 Index",
+        "image_path": str(chart_path),
+        "trigger_path": str(metadata_path),
+        "caption": "S&P 500 daily close, trailing month.",
+        "explanation": explanation,
+        "source": "S&P Dow Jones Indices via FRED",
+        "source_url": "https://fred.stlouisfed.org/series/SP500",
+        "priority": 1,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "updated_mtime": metadata_path.stat().st_mtime if metadata_path.exists() else 0,
+        "image_mtime": chart_path.stat().st_mtime if chart_path.exists() else 0,
+    }
 
 
 def web_search_chart_fallback(top_stories: list[Story],
@@ -1602,7 +1721,15 @@ def web_search_chart_fallback(top_stories: list[Story],
                     return chart
             except Exception as exc:
                 errors.append(f"Web-search chart fallback ({series_id}): {type(exc).__name__}")
-    # Absolute last resort: 10-year Treasury (most stable FRED series)
+    # Absolute last resort: S&P 500, trailing month. Equities trade nearly
+    # every weekday, so this is the most reliably-available chart of all.
+    try:
+        chart = build_sp500_one_month_chart(now)
+        if chart:
+            return chart
+    except Exception as exc:
+        errors.append(f"Last-resort S&P 500 chart: {type(exc).__name__}")
+    # Secondary safety net if FRED's S&P 500 series itself is unreachable.
     try:
         chart = build_fred_chart(
             series_id="DGS10", chart_id="fallback_dgs10_last",
@@ -1642,6 +1769,8 @@ def news_fallback_chart(config: dict[str, Any], top_stories: list[Story],
         try:
             if spec["series_id"] == "GLOBAL_INFL":
                 chart = build_global_inflation_chart(now)
+            elif spec["series_id"] == "SP500":
+                chart = build_sp500_one_month_chart(now)
             else:
                 chart = build_fred_chart(
                     series_id=spec["series_id"], chart_id=spec["chart_id"],
@@ -1966,6 +2095,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     top, leader_post, research_pick, tldr = claude_curate(
         news_candidates, leader_candidates, research_candidates, config, errors,
     )
+    top = enforce_category_floor(top, news_candidates)
     research_items = [research_pick] if research_pick else []
 
     total_items = len(top) + (1 if leader_post else 0)
