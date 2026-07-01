@@ -51,6 +51,8 @@ TOPIC_WEIGHTS = {
     "science": 7, "research": 7, "study": 7, "arxiv": 7,
     "medicine": 8, "health": 7, "clinical": 8, "cancer": 8, "drug": 7,
     "world cup": 6, "football": 4, "soccer": 5,
+    "politics": 6, "congress": 6, "senate": 6, "white house": 7,
+    "president": 5, "election": 7, "legislation": 6,
 }
 
 SOURCE_BONUS = {
@@ -80,6 +82,7 @@ NEWS_FEEDS = [
     ("Google News: Science", "https://news.google.com/rss/search?q=science+research+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("Google News: Medicine", "https://news.google.com/rss/search?q=medicine+healthcare+when:1d&hl=en-US&gl=US&ceid=US:en"),
     ("Google News: World Cup", "https://news.google.com/rss/search?q=FIFA+World+Cup+when:1d&hl=en-US&gl=US&ceid=US:en"),
+    ("Google News: Politics", "https://news.google.com/rss/search?q=US+politics+congress+government+senate+when:1d&hl=en-US&gl=US&ceid=US:en"),
 ]
 
 ECONOMIST_FEEDS = [
@@ -294,7 +297,7 @@ def category(story: Story) -> str:
         return "tech"
     if any(x in text for x in ("election", "congress", "senate", "white house",
                                "president", "parliament", "government", "policy",
-                               "diplomat", "sanction")):
+                               "diplomat", "sanction", "politics", "legislation")):
         return "politics"
     if any(x in text for x in ("research", "science", "study", "arxiv")):
         return "science"
@@ -512,9 +515,10 @@ def claude_curate(
     prompt = (
         "You are the editor of '" + config['newsletter_name'] + "', a concise daily briefing for a "
         "university professor interested in AI, economics, finance, technology, science, academic "
-        "research, medicine, and the football World Cup. Rank by Impact x Novelty x Relevance, "
-        "weighting relevance heavily toward AI, economics, finance, academic research, and "
-        "medicine. Avoid celebrity news, entertainment, low-impact political commentary, "
+        "research, medicine, politics, and the football World Cup. Rank by Impact x Novelty x "
+        "Relevance, weighting relevance heavily toward AI, economics, finance, academic research, "
+        "medicine, and significant political developments. Avoid celebrity news, entertainment, "
+        "frivolous or low-impact political commentary, "
         "investment-promotion content, and duplicate coverage of the same underlying story.\n\n"
         f"From news_candidates choose exactly {top_n} items (fewer only if the pool is smaller), "
         "ordered most consequential first. Deliberately spread coverage across topics: include no more than 2 AI/tech items, and make sure economics/finance, medicine/health, and academic research each appear when qualifying candidates exist. Also include at least one substantive politics/government/policy item and one football/World Cup item whenever a qualifying candidate exists -- 'substantive' means real policy, elections, or major geopolitical developments, not gossip or opinion-column speculation. For each "
@@ -678,7 +682,7 @@ def chart_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageF
 
 def fred_observations(series_id: str, start: str) -> list[tuple[dt.date, float]]:
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-    rows = list(csv.DictReader(fetch(url).decode("utf-8-sig").splitlines()))
+    rows = list(csv.DictReader(fetch(url, timeout=45).decode("utf-8-sig").splitlines()))
     observations: list[tuple[dt.date, float]] = []
     for row in rows:
         try:
@@ -921,7 +925,7 @@ def fred_chart_sources() -> list[dict[str, Any]]:
              caption="Year-over-year consumer price inflation in the United States.",
              source="U.S. Bureau of Labor Statistics via FRED",
              source_url="https://fred.stlouisfed.org/series/CPIAUCSL",
-             priority=10, start="2014-01-01", yoy_lag=12,
+             priority=12, start="2014-01-01", yoy_lag=12,
              explanation_template=(
                  "Consumer prices were {latest}% higher than a year earlier in {period}; "
                  "inflation {direction} from {previous}% the month before. This is the "
@@ -1443,10 +1447,12 @@ def gdp_per_capita_chart_sources(config: dict[str, Any], now: dt.datetime,
 
 
 def select_chart_of_the_day(config: dict[str, Any],
-                            now: dt.datetime | None = None) -> dict[str, Any] | None:
+                            now: dt.datetime | None = None,
+                            repeat_after_days: int = 7) -> dict[str, Any] | None:
     if now is None:
         now = dt.datetime.now(ZoneInfo(config["timezone"]))
     state = load_chart_state()
+    now_utc = dt.datetime.now(dt.timezone.utc)
     candidates: list[dict[str, Any]] = []
     sources = [{**source, "priority": source.get("priority", 100)}
                for source in config.get("chart_sources", [])]
@@ -1481,8 +1487,20 @@ def select_chart_of_the_day(config: dict[str, Any],
         if trigger_path != image_path and image_mtime < trigger_mtime:
             continue
         updated_at = max(image_mtime, trigger_mtime)
-        last_featured = float(state.get(source["id"], {}).get("featured_mtime", 0))
-        if updated_at <= last_featured:
+        chart_state = state.get(source["id"], {})
+        last_featured = float(chart_state.get("featured_mtime", 0))
+        data_is_new = updated_at > last_featured
+        stale_enough = False
+        last_featured_at = chart_state.get("featured_at", "")
+        if last_featured_at:
+            try:
+                age_days = (now_utc - dt.datetime.fromisoformat(last_featured_at)).days
+                stale_enough = age_days >= repeat_after_days
+            except ValueError:
+                pass
+        else:
+            stale_enough = True  # never featured before
+        if not data_is_new and not stale_enough:
             continue
         candidates.append({
             **source,
