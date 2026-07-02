@@ -795,7 +795,7 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
     period = (
         f"Q{((latest_date.month - 1) // 3) + 1} {latest_date.year}"
         if series_id == "GDP"
-        else latest_date.strftime("%B %Y") if yoy_lag else latest_date.strftime("%B %#d, %Y" if os.name == "nt" else "%B %-d, %Y")
+        else latest_date.strftime("%B %Y") if (yoy_lag or series_id == "UNRATE") else latest_date.strftime("%B %#d, %Y" if os.name == "nt" else "%B %-d, %Y")
     )
     explanation = explanation_template.format(
         latest=f"{latest_value:.1f}", previous=f"{previous_value:.1f}",
@@ -930,6 +930,17 @@ def fred_chart_sources() -> list[dict[str, Any]]:
                  "Consumer prices were {latest}% higher than a year earlier in {period}; "
                  "inflation {direction} from {previous}% the month before. This is the "
                  "headline CPI measure most directly comparable with household experience.")),
+        dict(series_id="UNRATE", chart_id="fred_unemployment",
+             title="U.S. Unemployment Rate Over the Last 10 Years",
+             subtitle="Civilian unemployment rate, seasonally adjusted, monthly",
+             caption="The share of the U.S. labor force that is unemployed and actively seeking work.",
+             source="U.S. Bureau of Labor Statistics via FRED",
+             source_url="https://fred.stlouisfed.org/series/UNRATE",
+             priority=11, start="2014-01-01", yoy_lag=0,
+             explanation_template=(
+                 "The U.S. unemployment rate was {latest}% in {period}, having {direction} "
+                 "from {previous}% the month before. It is one of the labor market's most "
+                 "closely watched gauges and a key input to Federal Reserve policy.")),
         dict(series_id="DGS10", chart_id="fred_treasury_10y",
              title="10-Year U.S. Treasury Yield",
              subtitle="Daily market yield, last two years",
