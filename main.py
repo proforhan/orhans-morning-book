@@ -811,6 +811,9 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
         "source": source,
         "source_url": source_url,
         "priority": priority,
+        # Content signature: on ephemeral runners file mtimes are fresh every
+        # run, so featuring once per data release must key on the data itself.
+        "signature": metadata["data_signature"],
     }
 
 
@@ -941,6 +944,17 @@ def fred_chart_sources() -> list[dict[str, Any]]:
                  "The U.S. unemployment rate was {latest}% in {period}, having {direction} "
                  "from {previous}% the month before. It is one of the labor market's most "
                  "closely watched gauges and a key input to Federal Reserve policy.")),
+        dict(series_id="MORTGAGE30US", chart_id="fred_mortgage_30y",
+             title="30-Year Fixed Mortgage Rate Over the Last 5 Years",
+             subtitle="Weekly average commitment rate, Freddie Mac survey",
+             caption="The typical U.S. 30-year fixed mortgage rate.",
+             source="Freddie Mac via FRED",
+             source_url="https://fred.stlouisfed.org/series/MORTGAGE30US",
+             priority=11, start="2019-01-01", yoy_lag=0, years_plotted=5,
+             explanation_template=(
+                 "The average 30-year fixed mortgage rate was {latest}% in the week of "
+                 "{period}; it {direction} from {previous}% the week before. It is "
+                 "the single rate that most directly sets the cost of buying a home.")),
         dict(series_id="DGS10", chart_id="fred_treasury_10y",
              title="10-Year U.S. Treasury Yield",
              subtitle="Daily market yield, last two years",
@@ -1894,8 +1908,9 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         if os.name != "nt"
         else now.strftime("%B %#d, %Y, %A")
     )
-    unavailable = "; ".join(errors[:6])
-    source_note = f"<p><small><strong>Source notes:</strong> {esc(unavailable)}</small></p>" if unavailable else ""
+    # Internal source errors are logged to latest.json and the scheduler log,
+    # but never shown in the delivered newsletter.
+    source_note = ""
 
     # Top News: insert the thought-leader item among the numbered stories.
     leader_position = min(3, len(top))
