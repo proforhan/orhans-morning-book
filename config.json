@@ -31,6 +31,21 @@
     "years": 10,
     "priority": 15
   },
+  "zillow_metros": {
+    "csv_url": "https://files.zillowstatic.com/research/public_csvs/zhvi/City_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
+    "title": "U.S. Home Prices: Major Metro Areas",
+    "source_url": "https://www.zillow.com/research/data/",
+    "years": 10,
+    "priority": 14,
+    "cities": [
+      { "name": "New York", "state": "NY" },
+      { "name": "Los Angeles", "state": "CA" },
+      { "name": "Chicago", "state": "IL" },
+      { "name": "Houston", "state": "TX" },
+      { "name": "Phoenix", "state": "AZ" },
+      { "name": "Miami", "state": "FL" }
+    ]
+  },
   "gdp_per_capita": {
     "enabled": true,
     "indicator": "NY.GDP.PCAP.CD",

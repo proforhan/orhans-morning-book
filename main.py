@@ -245,15 +245,70 @@ def canonical_title(title: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", title)
 
 
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "at",
+    "by", "from", "is", "are", "was", "were", "be", "as", "it", "its", "this",
+    "that", "after", "over", "amid", "says", "said", "into", "up",
+    "out", "than", "how", "why", "what", "will", "has", "have", "had", "his",
+    "her", "their", "not", "but", "about",
+}
+
+
+def _significant_words(title: str) -> set[str]:
+    """Lowercased, stopword-free, crudely-singularized words from a headline.
+
+    Used only for fuzzy duplicate detection (see deduplicate()); a rough
+    normalisation is enough since it just needs two differently-worded
+    headlines about the same event to land on mostly the same word set.
+    """
+    tokens = re.findall(r"[a-z0-9]+", title.lower())
+    result: set[str] = set()
+    for w in tokens:
+        if w in _STOPWORDS or len(w) <= 2:
+            continue
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        result.add(w)
+    return result
+
+
 def deduplicate(stories: list[Story]) -> list[Story]:
+    """Drop stories that are the same underlying story as one already kept.
+
+    Two passes catch two different failure modes. The hash pass (unchanged)
+    catches syndicated copies with identical or near-identical headlines. The
+    word-overlap pass added here catches the case that let duplicate coverage
+    through before: two differently-worded articles (e.g. two separate Google
+    News hits, or a Reuters + a Google-News-AI-feed hit) describing the same
+    underlying event -- most visibly, the same AI story appearing twice in a
+    single edition because its two headlines never hashed the same. Overlap
+    is measured against the smaller title's word count (not the union), and
+    at least 3 shared significant words are required, so two short headlines
+    that merely share a couple of generic words (e.g. two different "Fed"
+    stories) are not falsely merged.
+    """
     seen: set[str] = set()
     result: list[Story] = []
+    kept_words: list[set[str]] = []
     for story in stories:
         key = " ".join(canonical_title(story.title).split()[:12])
         digest = hashlib.sha1(key.encode()).hexdigest()[:12]
-        if digest not in seen:
-            seen.add(digest)
-            result.append(story)
+        if digest in seen:
+            continue
+        words = _significant_words(story.title)
+        is_dup = False
+        for prior in kept_words:
+            if not words or not prior:
+                continue
+            overlap = words & prior
+            if len(overlap) >= 3 and len(overlap) / min(len(words), len(prior)) >= 0.5:
+                is_dup = True
+                break
+        if is_dup:
+            continue
+        seen.add(digest)
+        kept_words.append(words)
+        result.append(story)
     return result
 
 
@@ -361,6 +416,26 @@ def enforce_category_floor(top: list[Story], pool: list[Story]) -> list[Story]:
             result[worst] = candidate
         used_links.add(candidate.link)
     return result
+
+
+def enforce_total_cap(top: list[Story], max_total: int) -> list[Story]:
+    """Trim `top` to `max_total` items without undoing enforce_category_floor.
+
+    The previous logic (`top = top[:max_total]`) sliced the list by position
+    after the floor swap had already run, so whenever a thought-leader post
+    pushed the total over the cap, the floor-guaranteed politics/football
+    story -- usually swapped into a low-scoring, late-list slot -- was the
+    first thing chopped off. This drops only non-floor items, worst score
+    first, and always keeps every FLOOR_CATEGORIES story.
+    """
+    if len(top) <= max_total:
+        return top
+    floor_items = [s for s in top if category(s) in FLOOR_CATEGORIES]
+    other_items = [s for s in top if category(s) not in FLOOR_CATEGORIES]
+    keep_budget = max(0, max_total - len(floor_items))
+    kept_others = sorted(other_items, key=lambda s: s.score, reverse=True)[:keep_budget]
+    keep_ids = {id(s) for s in floor_items} | {id(s) for s in kept_others}
+    return [s for s in top if id(s) in keep_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -1312,6 +1387,110 @@ def zillow_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
     }]
 
 
+def zillow_metro_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a major-U.S.-metro home-price chart from Zillow's public ZHVI CSV.
+
+    Unlike zillow_chart_sources (one state's cities), this panel spans several
+    states, so each target city is matched on (city name, state) together
+    rather than filtering the whole CSV down to a single state first. Reads
+    "zillow_metros" from config: {"csv_url", "title", "years", "priority",
+    "cities": [{"name": "New York", "state": "NY"}, ...]}. Any failure (missing
+    config, unreachable CSV, no matching rows) simply yields no chart.
+    """
+    spec = config.get("zillow_metros")
+    if not spec or not spec.get("csv_url"):
+        return []
+    wanted = [
+        (c["name"].strip(), c["state"].strip().upper())
+        for c in spec.get("cities", [])
+        if c.get("name") and c.get("state")
+    ]
+    targets = {(name.lower(), state) for name, state in wanted}
+    years = int(spec.get("years", 10))
+    if not targets:
+        return []
+
+    try:
+        text = fetch(spec["csv_url"]).decode("utf-8-sig", errors="replace")
+    except Exception:
+        return []
+    reader = csv.reader(text.splitlines())
+    try:
+        header = next(reader)
+    except StopIteration:
+        return []
+    idx = {name: i for i, name in enumerate(header)}
+    date_cols = [(i, dt.date.fromisoformat(name))
+                 for i, name in enumerate(header)
+                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}", name)]
+    if not date_cols or "RegionName" not in idx or "State" not in idx:
+        return []
+    latest_date = date_cols[-1][1]
+    cutoff = latest_date.replace(year=latest_date.year - years)
+
+    found: dict[tuple[str, str], list[tuple[dt.date, float]]] = {}
+    for row in reader:
+        if len(row) <= idx["State"]:
+            continue
+        state = row[idx["State"]].strip().upper()
+        name = row[idx["RegionName"]].strip()
+        key = (name.lower(), state)
+        if key not in targets:
+            continue
+        pts: list[tuple[dt.date, float]] = []
+        for col, d in date_cols:
+            if d < cutoff or len(row) <= col or not row[col].strip():
+                continue
+            try:
+                pts.append((d, float(row[col])))
+            except ValueError:
+                continue
+        if len(pts) >= 2:
+            found[key] = pts
+
+    if not found:
+        return []
+    # Preserve the configured city order; only include cities actually found.
+    ordered = [
+        (f"{name}, {state}", found[(name.lower(), state)])
+        for name, state in wanted
+        if (name.lower(), state) in found
+    ]
+    signature = hashlib.sha256(
+        json.dumps({label: [(d.isoformat(), round(v, 1)) for d, v in p] for label, p in ordered},
+                   separators=(",", ":")).encode()
+    ).hexdigest()
+
+    chart_path = OUTPUT / "zillow_major_metros.png"
+    title = spec.get("title", "U.S. Home Prices: Major Metro Areas")
+    draw_multi_line_chart(
+        chart_path, ordered,
+        title=title,
+        subtitle=f"Zillow Home Value Index, last {years} years",
+        footer="Source: Zillow Research (ZHVI, mid-tier, smoothed & seasonally adjusted)",
+    )
+    newest = max((p[-1] for _, p in ordered), key=lambda x: x[0])
+    explanation = (
+        "Typical home values across "
+        + ", ".join(label for label, _ in ordered)
+        + f", on Zillow's Home Value Index through {newest[0].strftime('%B %Y')}. "
+        "The chart compares housing momentum across major U.S. metro areas nationwide, "
+        "rather than one region alone."
+    )
+    return [{
+        "id": "zillow_major_metros",
+        "title": title,
+        "image_path": str(chart_path),
+        "trigger_path": str(chart_path),
+        "caption": "Ten-year Zillow Home Value Index trends for major U.S. metro areas.",
+        "explanation": explanation,
+        "source": "Zillow Research",
+        "source_url": spec.get("source_url", "https://www.zillow.com/research/data/"),
+        "priority": int(spec.get("priority", 14)),
+        "signature": signature,
+    }]
+
+
 # --- GDP per capita: rotating top-10 by world region (World Bank WDI) ---------
 
 # World Bank 2-letter country ids grouped by continent. Aggregates (World, EU,
@@ -1484,7 +1663,11 @@ def select_chart_of_the_day(config: dict[str, Any],
     sources.extend(fred_chart_sources())
     sources.extend(sheet_chart_sources(config))
     sources.extend(zillow_chart_sources(config))
+    sources.extend(zillow_metro_chart_sources(config))
     sources.extend(gdp_per_capita_chart_sources(config, now, state))
+    weekly_sp500 = sp500_weekly_chart_source(now)
+    if weekly_sp500:
+        sources.append(weekly_sp500)
     for source in sources:
         # Content-signature charts (sheet/FRED in the cloud) feature once per
         # data change and do not rely on local file modification times.
@@ -1697,6 +1880,68 @@ def build_sp500_one_month_chart(now: dt.datetime) -> dict[str, Any] | None:
         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "updated_mtime": metadata_path.stat().st_mtime if metadata_path.exists() else 0,
         "image_mtime": chart_path.stat().st_mtime if chart_path.exists() else 0,
+    }
+
+
+def sp500_weekly_chart_source(now: dt.datetime) -> dict[str, Any] | None:
+    """Friday-only Chart of the Day candidate: the S&P 500's closes for the
+    week just finishing.
+
+    This only returns a candidate on Fridays, and its priority (8) is set
+    below Orhan's own defined economic updates -- the Walmart basket
+    (priority 20) and Zillow home-price panels (priority 15/14) -- but above
+    the GDP-per-capita rotation (priority 5). So on a Friday, it only wins
+    Chart of the Day if neither of Orhan's own tracked economic sources has
+    fresh data that day; the rest of the week it is simply not offered.
+    """
+    if now.weekday() != 4:  # Monday=0 ... Friday=4
+        return None
+    chart_id = "sp500_weekly_friday"
+    chart_path = OUTPUT / f"{chart_id}.png"
+    monday = now.date() - dt.timedelta(days=now.weekday())
+    start = (monday - dt.timedelta(days=12)).isoformat()
+    try:
+        observations = fred_observations("SP500", start)
+    except Exception:
+        return None
+    week = [(d, v) for d, v in observations if d >= monday]
+    if len(week) < 2:
+        week = observations[-5:]
+    if len(week) < 2:
+        return None
+    first_date, first_value = week[0]
+    latest_date, latest_value = week[-1]
+    signature = hashlib.sha256(json.dumps(
+        [(d.isoformat(), round(v, 2)) for d, v in week], separators=(",", ":"),
+    ).encode()).hexdigest()
+    subtitle_week = monday.strftime("%B %#d" if os.name == "nt" else "%B %-d")
+    draw_line_chart(
+        chart_path, week,
+        "S&P 500: This Week",
+        f"Daily close, week of {subtitle_week}",
+        "Source: S&P Dow Jones Indices via FRED",
+        unit="",
+    )
+    change_pct = (latest_value / first_value - 1) * 100 if first_value else 0.0
+    direction = "up" if change_pct > 0 else "down" if change_pct < 0 else "flat"
+    explanation = (
+        f"The S&P 500 closed the week {direction} {abs(change_pct):.1f}%, moving from "
+        f"{first_value:,.0f} on {first_date.strftime('%A')} to {latest_value:,.0f} on "
+        f"{latest_date.strftime('%A')}. Shown only on Fridays, and only when none of the "
+        "other tracked economic updates (Walmart basket, Zillow home prices) has fresher "
+        "data that day."
+    )
+    return {
+        "id": chart_id,
+        "title": "S&P 500: This Week",
+        "image_path": str(chart_path),
+        "trigger_path": str(chart_path),
+        "caption": "S&P 500 daily closes for the current trading week.",
+        "explanation": explanation,
+        "source": "S&P Dow Jones Indices via FRED",
+        "source_url": "https://fred.stlouisfed.org/series/SP500",
+        "priority": 8,
+        "signature": signature,
     }
 
 
@@ -2144,7 +2389,8 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
 
     total_items = len(top) + (1 if leader_post else 0)
     if total_items > 6:
-        top = top[:6 - (1 if leader_post else 0)]
+        top = enforce_total_cap(top, 6 - (1 if leader_post else 0))
+        total_items = len(top) + (1 if leader_post else 0)
 
     chart_of_day = select_chart_of_the_day(config, now)
     if not chart_of_day:
