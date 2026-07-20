@@ -22,5 +22,10 @@
       "Americas",
       "Oceania"
     ]
+  },
+  "zillow_major_metros": {
+    "featured_mtime": 1784545601.561681,
+    "featured_at": "2026-07-20T11:06:43.817765+00:00",
+    "featured_signature": "58eff732ffcfe040f359ab6476c20fc2c697ae47f722757eb6ee79db6d608f47"
   }
 }
