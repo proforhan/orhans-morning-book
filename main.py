@@ -2532,6 +2532,99 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Buttondown delivery (to newsletter subscribers)
+# ---------------------------------------------------------------------------
+
+BUTTONDOWN_API = "https://api.buttondown.com/v1"
+
+
+def buttondown_upload_image(api_key: str, path: Path) -> str | None:
+    """Upload a chart PNG to Buttondown and return its hosted public URL.
+
+    Buttondown can't render the inline `cid:` image the SMTP edition relies on,
+    so the chart has to live at a real URL. Returns None if the upload fails,
+    letting the caller drop the image instead of shipping a broken one.
+    """
+    data = path.read_bytes()
+    subtype = path.suffix.lower().lstrip(".") or "png"
+    if subtype == "jpg":
+        subtype = "jpeg"
+    boundary = "----OMIButtondown" + hashlib.sha1(os.urandom(16)).hexdigest()[:20]
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="image"; filename="{path.name}"\r\n'.encode(),
+        f"Content-Type: image/{subtype}\r\n\r\n".encode(),
+        data,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(
+        f"{BUTTONDOWN_API}/images",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Token {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read())
+    except Exception:
+        return None
+    return result.get("image") or result.get("url")
+
+
+def send_via_buttondown(config: dict[str, Any], subject: str, body: str) -> dict[str, Any] | None:
+    """Queue the edition to Buttondown subscribers, if configured.
+
+    Gated on BUTTONDOWN_API_KEY: with no key (local runs, and the manual
+    "test only" CI run, which withholds it) this is a no-op, so the Gmail SMTP
+    path is completely unaffected. The inline chart is re-hosted on Buttondown
+    and its `cid:` reference rewritten to the hosted URL; if that fails the
+    image is dropped rather than shown broken. The email is then created with
+    status `about_to_send`, which queues it to every confirmed subscriber
+    (Buttondown sends within a few minutes). The extra header confirms the
+    immediate send that newer API versions otherwise hold back for safety.
+    """
+    api_key = os.getenv("BUTTONDOWN_API_KEY")
+    if not api_key:
+        return None
+
+    html_body = body
+    if "cid:chart-of-the-day" in html_body:
+        try:
+            saved = json.loads((OUTPUT / "latest.json").read_text(encoding="utf-8"))
+            chart = saved.get("chart_of_the_day")
+        except (OSError, json.JSONDecodeError):
+            chart = select_chart_of_the_day(config)
+        hosted = None
+        if chart and chart.get("image_path"):
+            hosted = buttondown_upload_image(api_key, Path(chart["image_path"]))
+        if hosted:
+            html_body = html_body.replace("cid:chart-of-the-day", hosted)
+        else:
+            html_body = re.sub(r"<img[^>]*cid:chart-of-the-day[^>]*>", "", html_body)
+
+    payload = json.dumps({
+        "subject": subject,
+        "body": html_body,
+        "status": "about_to_send",
+    }).encode()
+    req = urllib.request.Request(
+        f"{BUTTONDOWN_API}/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Token {api_key}",
+            "Content-Type": "application/json",
+            "X-Buttondown-Live-Dangerously": "true",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return json.loads(response.read())
+
+
+# ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
@@ -2661,6 +2754,14 @@ def main() -> int:
     if not args.no_send:
         send_email(load_config(), subject, body)
         print("Email sent.")
+        # Also deliver to Buttondown subscribers when configured. A failure here
+        # must not fail the run — the SMTP edition has already gone out.
+        try:
+            queued = send_via_buttondown(load_config(), subject, body)
+            if queued is not None:
+                print(f"Buttondown edition queued to subscribers (id {queued.get('id', '?')}).")
+        except Exception as exc:
+            print(f"Buttondown delivery failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         if os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}:
             record_seen_links([s.get("link", "") for s in manifest.get("stories", [])])
     return 0
