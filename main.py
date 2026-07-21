@@ -23,6 +23,7 @@ import re
 import smtplib
 import ssl
 import sys
+import threading
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -157,6 +158,39 @@ def fetch(url: str, timeout: int = 20) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read()
+
+
+def fetch_with_deadline(url: str, timeout: int = 15) -> bytes | None:
+    """Like fetch(), but guarantees the caller gets control back within
+    `timeout` seconds no matter what the far end does.
+
+    urllib's own `timeout` only bounds each individual socket operation
+    (connect, each recv chunk) -- a server that keeps trickling bytes
+    slowly enough (common anti-bot behaviour toward an unrecognised
+    User-Agent) can make response.read() block far longer than that
+    without ever tripping it. This runs the real fetch in a daemon thread
+    and simply stops waiting at the deadline; if the request is genuinely
+    stuck, the thread is abandoned (harmless -- it's daemonized, so it
+    can't block interpreter exit) rather than wedging the entire run.
+    Returns None on timeout so callers can distinguish "timed out" from
+    "raised an exception" from "succeeded".
+    """
+    outcome: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            outcome["data"] = fetch(url, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - re-raised on the caller's side
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return None
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("data")
 
 
 def clean_text(value: str | None) -> str:
@@ -1292,10 +1326,14 @@ def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
     if not spec or not spec.get("report_url"):
         return ""
     try:
-        raw = fetch(spec["report_url"]).decode("utf-8", errors="replace")
+        raw_bytes = fetch_with_deadline(spec["report_url"], timeout=15)
     except Exception as exc:
         errors.append(f"Zumper rent report: {type(exc).__name__}")
         return ""
+    if raw_bytes is None:
+        errors.append("Zumper rent report: timed out")
+        return ""
+    raw = raw_bytes.decode("utf-8", errors="replace")
 
     extractor = _TableExtractor()
     try:
@@ -2383,6 +2421,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
           <p><small><strong>Source:</strong> {esc(chart_of_day["source"])}
           {f'· <a href="{esc(chart_of_day["source_url"])}">View source</a>' if chart_of_day.get("source_url") else ''}
           {f"· Updated {esc(updated_label)}" if updated_label else ""}</small></p>'''
+    chart_html += rent_html
 
     return f"""<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -2407,7 +2446,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="7" bgcolor="#8A2D3C">
       <tr><td align="center">
         <font face="Arial, sans-serif" color="#FFFFFF" size="2">
-          TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY &nbsp;·&nbsp; RENT WATCH
+          TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY
         </font>
       </td></tr>
       </table>
@@ -2426,7 +2465,6 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       {section_html("1 · Top News", top_html, "No qualifying stories were available in this run.")}
       {section_html("2 · Research Radar", research_html, "No qualifying research items were available in this run.")}
       {section_html("3 · Chart of the Day", chart_html, "No newly updated chart today; the next release of the Walmart tracker, Zillow data, GDP, or CPI will appear here.")}
-      {section_html("4 · Rent Watch", rent_html, "") if rent_html else ""}
       {source_note}
 
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#17324D">
