@@ -28,6 +28,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from email.message import EmailMessage
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1231,6 +1232,173 @@ def sheet_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
     }]
 
 
+class _TableExtractor(HTMLParser):
+    """Dependency-free <table> extractor: tags stripped, cell text kept.
+
+    Good enough for a well-formed, mostly-static WordPress/React-rendered
+    table like Zumper's rent report. If the source reworks its markup this
+    simply returns no usable table and the caller skips gracefully -- the
+    same "if the source moves, yield nothing" pattern used by
+    zillow_chart_sources and sheet_chart_sources elsewhere in this file.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[list[str]]] = []
+        self._table: list[list[str]] | None = None
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "table" and self._table is not None:
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+        elif tag == "tr" and self._row is not None:
+            if self._table is not None:
+                self._table.append(self._row)
+            self._row = None
+        elif tag in ("td", "th") and self._cell is not None:
+            if self._row is not None:
+                self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
+    """Monthly headline stat from Zumper's National Rent Report.
+
+    Unlike Zillow (a clean historical CSV), Zumper's report page only ever
+    exposes the current month's levels and %-changes -- no downloadable
+    series. That means there's nothing to plot as a proper trend line, so
+    this is deliberately a small text callout rather than a Chart of the
+    Day candidate. Returns an HTML fragment, or "" if the report couldn't be
+    fetched or parsed (page reworked, network hiccup, etc.) -- fails
+    silently like the other scrapers in this file rather than breaking the
+    send.
+    """
+    spec = config.get("zumper_rent")
+    if not spec or not spec.get("report_url"):
+        return ""
+    try:
+        raw = fetch(spec["report_url"]).decode("utf-8", errors="replace")
+    except Exception as exc:
+        errors.append(f"Zumper rent report: {type(exc).__name__}")
+        return ""
+
+    extractor = _TableExtractor()
+    try:
+        extractor.feed(raw)
+    except Exception as exc:
+        errors.append(f"Zumper rent report parse: {type(exc).__name__}")
+        return ""
+
+    # The header can be a two-row group ("1 Bedroom"/"2 Bedrooms" spanning
+    # a blank row above "City"/"Price"/...), so find whichever row actually
+    # contains "City" rather than assuming it's the table's first row.
+    data_table = None
+    for t in extractor.tables:
+        header_idx = next(
+            (i for i, row in enumerate(t) if any("city" in c.lower() for c in row)),
+            None,
+        )
+        if header_idx is not None and len(t) > header_idx + 1:
+            data_table = t[header_idx:]
+            break
+    if not data_table or len(data_table) < 2:
+        errors.append("Zumper rent report: data table not found")
+        return ""
+
+    def num(cell: str) -> float | None:
+        cleaned = cell.replace("$", "").replace(",", "").replace("%", "").strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    # Row shape (validated, not assumed): Ranking, Ranking Change, City,
+    # 1BR Price, 1BR M/M%, 1BR Y/Y%, 2BR Price, 2BR M/M%, 2BR Y/Y%.
+    watch_cities = spec.get("cities", [])
+    found: dict[str, dict[str, float | str]] = {}
+    for row in data_table[1:]:
+        if len(row) < 9:
+            continue
+        city_field = row[2].strip()
+        city_name = city_field.split(",")[0].strip()
+        br1_price, br1_yoy = num(row[3]), num(row[5])
+        br2_price, br2_yoy = num(row[6]), num(row[8])
+        if br1_price is None and br2_price is None:
+            continue
+        for wanted in watch_cities:
+            if wanted.lower() == city_name.lower() and wanted not in found:
+                found[wanted] = {
+                    "label": city_field, "br1_price": br1_price, "br1_yoy": br1_yoy,
+                    "br2_price": br2_price, "br2_yoy": br2_yoy,
+                }
+
+    if not found:
+        errors.append("Zumper rent report: none of the watched cities matched")
+        return ""
+
+    # The national headline number lives in article prose, not the table, so
+    # it's pulled with a tolerant regex; if Zumper's phrasing has changed
+    # since this was written, the national line is simply omitted rather
+    # than risking a wrong number.
+    text = html.unescape(re.sub(r"<[^>]+>", " ", raw))
+    national = re.search(
+        r"one-?bedroom rent.{0,80}?\$([\d,]+).{0,80}?(-?\d+(?:\.\d+)?)%\s*(?:year-over-year|annually|y/y)",
+        text, re.IGNORECASE | re.DOTALL,
+    )
+
+    def fmt_row(name: str, d: dict[str, float | str]) -> str:
+        bits = []
+        if d.get("br1_price") is not None:
+            yoy = d.get("br1_yoy")
+            yoy_s = f" ({yoy:+.1f}% y/y)" if isinstance(yoy, float) else ""
+            bits.append(f"1BR ${d['br1_price']:,.0f}{yoy_s}")
+        if d.get("br2_price") is not None:
+            yoy = d.get("br2_yoy")
+            yoy_s = f" ({yoy:+.1f}% y/y)" if isinstance(yoy, float) else ""
+            bits.append(f"2BR ${d['br2_price']:,.0f}{yoy_s}")
+        sep = " · "
+        return f"<strong>{esc(name)}</strong> — {esc(sep.join(bits))}"
+
+    lines = []
+    if national:
+        price = float(national.group(1).replace(",", ""))
+        yoy = float(national.group(2))
+        lines.append(f"<strong>National (1BR)</strong> — " + esc(f"${price:,.0f} ({yoy:+.1f}% y/y)"))
+    # Preserve the order requested in config rather than table rank order.
+    for wanted in watch_cities:
+        if wanted in found:
+            lines.append(fmt_row(wanted, found[wanted]))
+
+    if not lines:
+        return ""
+
+    return f"""
+      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#EDF3F7">
+      <tr><td>
+        <font face="Arial, sans-serif" color="#17324D" size="2">
+          {'<br>'.join(lines)}
+        </font>
+      </td></tr>
+      </table>
+      <p><small><strong>Source:</strong> Zumper National Rent Report ·
+      <a href="{esc(spec['report_url'])}">View report</a></small></p>"""
+
+
 def draw_multi_line_chart(path: Path, series: list[tuple[str, list[tuple[dt.date, float]]]],
                           title: str, subtitle: str, footer: str,
                           unit: str = "$") -> None:
@@ -2147,7 +2315,7 @@ def section_html(title: str, content: str, empty_message: str = "") -> str:
 def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str, Any]],
            top: list[Story], leader_post: Story | None, leader_notes: list[str],
            research: list[Story], chart_of_day: dict[str, Any] | None,
-           errors: list[str], tldr: str = "") -> str:
+           errors: list[str], tldr: str = "", rent_html: str = "") -> str:
     date_label = (
         now.strftime("%B %-d, %Y, %A")
         if os.name != "nt"
@@ -2239,7 +2407,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="7" bgcolor="#8A2D3C">
       <tr><td align="center">
         <font face="Arial, sans-serif" color="#FFFFFF" size="2">
-          TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY
+          TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY &nbsp;·&nbsp; RENT WATCH
         </font>
       </td></tr>
       </table>
@@ -2258,6 +2426,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       {section_html("1 · Top News", top_html, "No qualifying stories were available in this run.")}
       {section_html("2 · Research Radar", research_html, "No qualifying research items were available in this run.")}
       {section_html("3 · Chart of the Day", chart_html, "No newly updated chart today; the next release of the Walmart tracker, Zillow data, GDP, or CPI will appear here.")}
+      {section_html("4 · Rent Watch", rent_html, "") if rent_html else ""}
       {source_note}
 
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#17324D">
@@ -2404,8 +2573,9 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         chart_of_day = news_fallback_chart(config, top, now, errors)
     if not chart_of_day:
         chart_of_day = web_search_chart_fallback(top, now, errors)
+    rent_html = zumper_rent_snapshot(config, errors)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
-                  research_items, chart_of_day, errors, tldr)
+                  research_items, chart_of_day, errors, tldr, rent_html)
     OUTPUT.mkdir(exist_ok=True)
     dated = OUTPUT / f"omi_{now:%Y-%m-%d}.html"
     latest = OUTPUT / "latest.html"
