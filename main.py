@@ -1100,10 +1100,10 @@ def draw_dual_line_chart(path: Path, series: list[tuple[str, str, list[tuple[str
         x = point(index, y_min)[0]
         draw.text((x - 10, height - bottom + 8), label, fill="#666666", font=small_font)
 
-    colors = ["#17324D", "#8A2D3C"]
+    default_colors = ["#5DA9E9", "#8A2D3C"]
     legend_x = left
-    for order, (name, _, points) in enumerate(series):
-        color = colors[order % len(colors)]
+    for order, (name, given_color, points) in enumerate(series):
+        color = given_color or default_colors[order % len(default_colors)]
         pts = [point(i, value) for i, (_, value) in enumerate(points)]
         draw.line(pts, fill=color, width=3, joint="curve")
         last_x, last_y = pts[-1]
@@ -1192,7 +1192,7 @@ def sheet_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
         json.dumps(basket + official, separators=(",", ":")).encode()
     ).hexdigest()
 
-    series = [("Walmart basket (Irving, TX)", "#17324D", basket)]
+    series = [("Walmart basket (Irving, TX)", "#5DA9E9", basket)]
     if len(official) >= 2:
         series.append(("US official CPI (normalized)", "#8A2D3C", official))
 
@@ -2384,7 +2384,14 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     top, leader_post, research_pick, tldr = claude_curate(
         news_candidates, leader_candidates, research_candidates, config, errors,
     )
-    top = enforce_category_floor(top, news_candidates)
+    # Floor candidates are drawn from the full ranked `news` pool, not just
+    # news_candidates: select_diverse's per-category cap (2) can knock every
+    # politics story out of news_candidates on a heavy news day even though
+    # the dedicated "Google News: Politics" feed still has same-day coverage.
+    # Falling back to news_candidates alone would let the political floor
+    # silently fail on exactly the days it matters most.
+    floor_pool = deduplicate(news_candidates + news)
+    top = enforce_category_floor(top, floor_pool)
     research_items = [research_pick] if research_pick else []
 
     total_items = len(top) + (1 if leader_post else 0)
