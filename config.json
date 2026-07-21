@@ -113,5 +113,17 @@
       ],
       "news_query": "\"Brad Setser\" when:2d"
     }
-  ]
+  ],
+  "zumper_rent": {
+    "report_url": "https://www.zumper.com/rent-research/national-rent-report",
+    "cities": [
+      "New York",
+      "San Francisco",
+      "Chicago",
+      "Houston",
+      "Dallas",
+      "Austin",
+      "San Antonio"
+    ]
+  }
 }
