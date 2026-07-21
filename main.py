@@ -1392,40 +1392,41 @@ def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
     # The national headline number lives in article prose, not the table, so
     # it's pulled with a tolerant regex; if Zumper's phrasing has changed
     # since this was written, the national line is simply omitted rather
-    # than risking a wrong number.
+    # than risking a wrong number. Two-bedroom only, per Orhan's preference
+    # (the report emphasises one-bedroom in prose, so this looks for the
+    # two-bedroom figure specifically rather than reusing the 1BR sentence).
     text = html.unescape(re.sub(r"<[^>]+>", " ", raw))
     national = re.search(
-        r"one-?bedroom rent.{0,80}?\$([\d,]+).{0,80}?(-?\d+(?:\.\d+)?)%\s*(?:year-over-year|annually|y/y)",
+        r"two-?bedroom rent.{0,80}?\$([\d,]+).{0,80}?(-?\d+(?:\.\d+)?)%\s*(?:year-over-year|annually|y/y)",
         text, re.IGNORECASE | re.DOTALL,
     )
 
     def fmt_row(name: str, d: dict[str, float | str]) -> str:
-        bits = []
-        if d.get("br1_price") is not None:
-            yoy = d.get("br1_yoy")
-            yoy_s = f" ({yoy:+.1f}% y/y)" if isinstance(yoy, float) else ""
-            bits.append(f"1BR ${d['br1_price']:,.0f}{yoy_s}")
-        if d.get("br2_price") is not None:
-            yoy = d.get("br2_yoy")
-            yoy_s = f" ({yoy:+.1f}% y/y)" if isinstance(yoy, float) else ""
-            bits.append(f"2BR ${d['br2_price']:,.0f}{yoy_s}")
-        sep = " · "
-        return f"<strong>{esc(name)}</strong> — {esc(sep.join(bits))}"
+        price, yoy = d.get("br2_price"), d.get("br2_yoy")
+        if price is None:
+            return ""
+        yoy_s = f" ({yoy:+.1f}% y/y)" if isinstance(yoy, float) else ""
+        return f"<strong>{esc(name)}</strong> — " + esc(f"${price:,.0f}{yoy_s}")
 
     lines = []
     if national:
         price = float(national.group(1).replace(",", ""))
         yoy = float(national.group(2))
-        lines.append(f"<strong>National (1BR)</strong> — " + esc(f"${price:,.0f} ({yoy:+.1f}% y/y)"))
+        lines.append(f"<strong>National</strong> — " + esc(f"${price:,.0f} ({yoy:+.1f}% y/y)"))
     # Preserve the order requested in config rather than table rank order.
     for wanted in watch_cities:
         if wanted in found:
-            lines.append(fmt_row(wanted, found[wanted]))
+            row = fmt_row(wanted, found[wanted])
+            if row:
+                lines.append(row)
 
     if not lines:
         return ""
 
     return f"""
+      <h4>Rent Watch: Two-Bedroom Asking Rents</h4>
+      <p><small>Monthly median 2-bedroom asking rent, year-over-year change in parentheses,
+      via Zumper's National Rent Report.</small></p>
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#EDF3F7">
       <tr><td>
         <font face="Arial, sans-serif" color="#17324D" size="2">
