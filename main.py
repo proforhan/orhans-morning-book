@@ -1310,29 +1310,99 @@ class _TableExtractor(HTMLParser):
             self._cell.append(data)
 
 
-def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
-    """Monthly headline stat from Zumper's National Rent Report.
+def draw_rent_bar_chart(path: Path, bars: list[tuple[str, float, float | None]],
+                        title: str, subtitle: str, footer: str, unit: str = "$") -> None:
+    """Draw a labelled vertical bar chart comparing discrete categories (house style).
 
-    Unlike Zillow (a clean historical CSV), Zumper's report page only ever
-    exposes the current month's levels and %-changes -- no downloadable
-    series. That means there's nothing to plot as a proper trend line, so
-    this is deliberately a small text callout rather than a Chart of the
-    Day candidate. Returns an HTML fragment, or "" if the report couldn't be
-    fetched or parsed (page reworked, network hiccup, etc.) -- fails
-    silently like the other scrapers in this file rather than breaking the
-    send.
+    Unlike the line-chart helpers above, this compares a handful of named
+    categories side by side (e.g. cities) rather than plotting a value over
+    time -- for sources like Zumper's rent report where only a single
+    snapshot in time is available, never a downloadable historical series.
+    Each bar can carry an optional secondary value (e.g. year-over-year %
+    change), rendered as a small colored label beneath the bar.
+
+    Named distinctly from the existing horizontal draw_bar_chart() (used by
+    the GDP-per-capita rankings) since that one takes a different tuple shape
+    (name, value) with no secondary figure, and is oriented horizontally.
     """
+    width, height = 600, 320
+    left, top, right, bottom = 50, 70, 20, 62
+    image = Image.new("RGB", (width * CHART_SCALE, height * CHART_SCALE), "#FAF7F0")
+    draw = ScaledDraw(image)
+    title_font = chart_font(20, bold=True)
+    label_font = chart_font(11)
+    small_font = chart_font(10)
+    draw.text((left, 15), title, fill="#17324D", font=title_font)
+    draw.text((left, 40), subtitle, fill="#555555", font=small_font)
+
+    values = [value for _, value, _ in bars]
+    y_max = max(values) * 1.2 if values else 1.0
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    n = max(1, len(bars))
+    slot = plot_width / n
+    bar_width = slot * 0.55
+
+    for index, (name, value, secondary) in enumerate(bars):
+        bar_height = (value / y_max) * plot_height if y_max else 0
+        x0 = left + index * slot + (slot - bar_width) / 2
+        x1 = x0 + bar_width
+        y1 = top + plot_height
+        y0 = y1 - bar_height
+        color = "#8A2D3C" if name.lower() == "national" else "#17324D"
+        draw.rectangle((x0, y0, x1, y1), fill=color)
+
+        value_label = f"${value:,.0f}" if unit == "$" else f"{value:.1f}{unit}"
+        vl_width = draw.textlength(value_label, font=label_font)
+        draw.text((x0 + bar_width / 2 - vl_width / 2, y0 - 16), value_label,
+                  fill="#17324D", font=label_font)
+
+        if secondary is not None:
+            sec_label = f"{secondary:+.1f}%"
+            sec_color = "#2E6E4E" if secondary < 0 else "#8A2D3C" if secondary > 0 else "#666666"
+            sl_width = draw.textlength(sec_label, font=small_font)
+            draw.text((x0 + bar_width / 2 - sl_width / 2, y1 + 4), sec_label,
+                      fill=sec_color, font=small_font)
+
+        label = name if len(name) <= 13 else name[:12] + "…"
+        nl_width = draw.textlength(label, font=small_font)
+        draw.text((x0 + bar_width / 2 - nl_width / 2, y1 + 19), label,
+                  fill="#666666", font=small_font)
+
+    draw.line((left, top + plot_height, width - right, top + plot_height),
+              fill="#999999", width=1)
+    draw.text((left, height - 14), footer, fill="#777777", font=small_font)
+    path.parent.mkdir(exist_ok=True)
+    image.save(path, format="PNG", optimize=True)
+
+
+def zumper_chart_sources(config: dict[str, Any],
+                         errors: list[str] | None = None) -> list[dict[str, Any]]:
+    """Chart-of-the-Day candidate built from Zumper's National Rent Report.
+
+    Zumper's report page only ever exposes the current month's levels and
+    %-changes -- no downloadable historical series -- so rather than a trend
+    line this plots a cross-sectional comparison (this month's two-bedroom
+    asking rent, National plus the watched cities, side by side). A content
+    signature computed over the parsed price/YoY figures drives the
+    "feature once per report update" behaviour used throughout this file
+    (same mechanism as sheet_chart_sources/build_fred_chart), so the same
+    monthly numbers no longer repeat in the newsletter every single day --
+    only when Zumper's underlying figures actually change.
+    """
+    if errors is None:
+        errors = []
     spec = config.get("zumper_rent")
     if not spec or not spec.get("report_url"):
-        return ""
+        return []
     try:
         raw_bytes = fetch_with_deadline(spec["report_url"], timeout=15)
     except Exception as exc:
         errors.append(f"Zumper rent report: {type(exc).__name__}")
-        return ""
+        return []
     if raw_bytes is None:
         errors.append("Zumper rent report: timed out")
-        return ""
+        return []
     raw = raw_bytes.decode("utf-8", errors="replace")
 
     extractor = _TableExtractor()
@@ -1340,7 +1410,7 @@ def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
         extractor.feed(raw)
     except Exception as exc:
         errors.append(f"Zumper rent report parse: {type(exc).__name__}")
-        return ""
+        return []
 
     # The header can be a two-row group ("1 Bedroom"/"2 Bedrooms" spanning
     # a blank row above "City"/"Price"/...), so find whichever row actually
@@ -1356,7 +1426,7 @@ def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
             break
     if not data_table or len(data_table) < 2:
         errors.append("Zumper rent report: data table not found")
-        return ""
+        return []
 
     def num(cell: str) -> float | None:
         cleaned = cell.replace("$", "").replace(",", "").replace("%", "").strip()
@@ -1368,32 +1438,28 @@ def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
     # Row shape (validated, not assumed): Ranking, Ranking Change, City,
     # 1BR Price, 1BR M/M%, 1BR Y/Y%, 2BR Price, 2BR M/M%, 2BR Y/Y%.
     watch_cities = spec.get("cities", [])
-    found: dict[str, dict[str, float | str]] = {}
+    found: dict[str, dict[str, float | None]] = {}
     for row in data_table[1:]:
         if len(row) < 9:
             continue
         city_field = row[2].strip()
         city_name = city_field.split(",")[0].strip()
-        br1_price, br1_yoy = num(row[3]), num(row[5])
         br2_price, br2_yoy = num(row[6]), num(row[8])
-        if br1_price is None and br2_price is None:
+        if br2_price is None:
             continue
         for wanted in watch_cities:
             if wanted.lower() == city_name.lower() and wanted not in found:
-                found[wanted] = {
-                    "label": city_field, "br1_price": br1_price, "br1_yoy": br1_yoy,
-                    "br2_price": br2_price, "br2_yoy": br2_yoy,
-                }
+                found[wanted] = {"price": br2_price, "yoy": br2_yoy}
 
     if not found:
         errors.append("Zumper rent report: none of the watched cities matched")
-        return ""
+        return []
 
     # The national headline number lives in article prose, not the table, so
     # it's pulled with a tolerant regex; if Zumper's phrasing has changed
-    # since this was written, the national line is simply omitted rather
-    # than risking a wrong number. Two-bedroom only, per Orhan's preference
-    # (the report emphasises one-bedroom in prose, so this looks for the
+    # since this was written, the national bar is simply omitted rather than
+    # risking a wrong number. Two-bedroom only, per Orhan's preference (the
+    # report emphasises one-bedroom in prose, so this looks for the
     # two-bedroom figure specifically rather than reusing the 1BR sentence).
     text = html.unescape(re.sub(r"<[^>]+>", " ", raw))
     national = re.search(
@@ -1401,41 +1467,67 @@ def zumper_rent_snapshot(config: dict[str, Any], errors: list[str]) -> str:
         text, re.IGNORECASE | re.DOTALL,
     )
 
-    def fmt_row(name: str, d: dict[str, float | str]) -> str:
-        price, yoy = d.get("br2_price"), d.get("br2_yoy")
-        if price is None:
-            return ""
-        yoy_s = f" ({yoy:+.1f}% y/y)" if isinstance(yoy, float) else ""
-        return f"<strong>{esc(name)}</strong> — " + esc(f"${price:,.0f}{yoy_s}")
-
-    lines = []
+    bars: list[tuple[str, float, float | None]] = []
     if national:
-        price = float(national.group(1).replace(",", ""))
-        yoy = float(national.group(2))
-        lines.append(f"<strong>National</strong> — " + esc(f"${price:,.0f} ({yoy:+.1f}% y/y)"))
+        bars.append(("National", float(national.group(1).replace(",", "")),
+                     float(national.group(2))))
     # Preserve the order requested in config rather than table rank order.
     for wanted in watch_cities:
         if wanted in found:
-            row = fmt_row(wanted, found[wanted])
-            if row:
-                lines.append(row)
+            d = found[wanted]
+            bars.append((wanted, float(d["price"]), d["yoy"]))
 
-    if not lines:
-        return ""
+    if len(bars) < 2:
+        errors.append("Zumper rent report: not enough data points to chart")
+        return []
 
-    return f"""
-      <h4>Rent Watch: Two-Bedroom Asking Rents</h4>
-      <p><small>Monthly median 2-bedroom asking rent, year-over-year change in parentheses,
-      via Zumper's National Rent Report.</small></p>
-      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#EDF3F7">
-      <tr><td>
-        <font face="Arial, sans-serif" color="#17324D" size="2">
-          {'<br>'.join(lines)}
-        </font>
-      </td></tr>
-      </table>
-      <p><small><strong>Source:</strong> Zumper National Rent Report ·
-      <a href="{esc(spec['report_url'])}">View report</a></small></p>"""
+    signature = hashlib.sha256(json.dumps(
+        [(name, round(price, 2), round(yoy, 2) if yoy is not None else None)
+         for name, price, yoy in bars],
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+
+    chart_path = OUTPUT / "zumper_rent.png"
+    metadata_path = OUTPUT / "zumper_rent.json"
+    old_meta: dict[str, Any] = {}
+    if metadata_path.exists():
+        try:
+            old_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if old_meta.get("data_signature") != signature or not chart_path.exists():
+        draw_rent_bar_chart(
+            chart_path, bars,
+            title="Rent Watch: Two-Bedroom Asking Rents",
+            subtitle="Monthly median 2BR asking rent by city",
+            footer="Source: Zumper National Rent Report",
+        )
+        metadata_path.write_text(json.dumps({"data_signature": signature}, indent=2), encoding="utf-8")
+
+    national_bar = next((b for b in bars if b[0] == "National"), None)
+    if national_bar:
+        _, nat_price, nat_yoy = national_bar
+        yoy_phrase = f" ({nat_yoy:+.1f}% year-over-year)" if nat_yoy is not None else ""
+        explanation = (
+            f"The national median two-bedroom asking rent was ${nat_price:,.0f}{yoy_phrase} "
+            "in Zumper's latest report. "
+        )
+    else:
+        explanation = "Zumper's latest report figures for the tracked cities. "
+    explanation += "Bars compare the watched cities' current two-bedroom asking rents side by side."
+
+    return [{
+        "id": "zumper_rent",
+        "title": "Rent Watch: Two-Bedroom Asking Rents",
+        "image_path": str(chart_path),
+        "trigger_path": str(chart_path),
+        "caption": "Monthly median 2BR asking rent by city, via Zumper.",
+        "explanation": explanation,
+        "source": "Zumper National Rent Report",
+        "source_url": spec.get("report_url", ""),
+        "priority": int(spec.get("priority", 16)),
+        "signature": signature,
+    }]
 
 
 def draw_multi_line_chart(path: Path, series: list[tuple[str, list[tuple[dt.date, float]]]],
@@ -1859,7 +1951,8 @@ def gdp_per_capita_chart_sources(config: dict[str, Any], now: dt.datetime,
 
 def select_chart_of_the_day(config: dict[str, Any],
                             now: dt.datetime | None = None,
-                            repeat_after_days: int = 7) -> dict[str, Any] | None:
+                            repeat_after_days: int = 7,
+                            errors: list[str] | None = None) -> dict[str, Any] | None:
     if now is None:
         now = dt.datetime.now(ZoneInfo(config["timezone"]))
     state = load_chart_state()
@@ -1872,6 +1965,7 @@ def select_chart_of_the_day(config: dict[str, Any],
     sources.extend(zillow_chart_sources(config))
     sources.extend(zillow_metro_chart_sources(config))
     sources.extend(gdp_per_capita_chart_sources(config, now, state))
+    sources.extend(zumper_chart_sources(config, errors))
     weekly_sp500 = sp500_weekly_chart_source(now)
     if weekly_sp500:
         sources.append(weekly_sp500)
@@ -2354,7 +2448,7 @@ def section_html(title: str, content: str, empty_message: str = "") -> str:
 def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str, Any]],
            top: list[Story], leader_post: Story | None, leader_notes: list[str],
            research: list[Story], chart_of_day: dict[str, Any] | None,
-           errors: list[str], tldr: str = "", rent_html: str = "") -> str:
+           errors: list[str], tldr: str = "") -> str:
     date_label = (
         now.strftime("%B %-d, %Y, %A")
         if os.name != "nt"
@@ -2422,7 +2516,6 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
           <p><small><strong>Source:</strong> {esc(chart_of_day["source"])}
           {f'· <a href="{esc(chart_of_day["source_url"])}">View source</a>' if chart_of_day.get("source_url") else ''}
           {f"· Updated {esc(updated_label)}" if updated_label else ""}</small></p>'''
-    chart_html += rent_html
 
     return f"""<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -2700,14 +2793,13 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         top = enforce_total_cap(top, 6 - (1 if leader_post else 0))
         total_items = len(top) + (1 if leader_post else 0)
 
-    chart_of_day = select_chart_of_the_day(config, now)
+    chart_of_day = select_chart_of_the_day(config, now, errors=errors)
     if not chart_of_day:
         chart_of_day = news_fallback_chart(config, top, now, errors)
     if not chart_of_day:
         chart_of_day = web_search_chart_fallback(top, now, errors)
-    rent_html = zumper_rent_snapshot(config, errors)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
-                  research_items, chart_of_day, errors, tldr, rent_html)
+                  research_items, chart_of_day, errors, tldr)
     OUTPUT.mkdir(exist_ok=True)
     dated = OUTPUT / f"omi_{now:%Y-%m-%d}.html"
     latest = OUTPUT / "latest.html"
