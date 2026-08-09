@@ -663,7 +663,7 @@ def claude_curate(
         top: list[Story] = []
         for item in reply.get("top", [])[:top_n]:
             story = news_candidates[int(item["id"])]
-            story.summary = clean_text(item.get("summary")) or story.description[:360]
+            story.summary = clean_text(item.get("summary")) or first_sentence(story.description)
             story.why = clean_text(item.get("why")) or "A potentially consequential development."
             top.append(story)
         if not top:
@@ -678,7 +678,7 @@ def claude_curate(
         research = None
         if reply.get("research") and research_candidates:
             research = research_candidates[int(reply["research"]["id"])]
-            research.summary = clean_text(reply["research"].get("summary")) or research.description[:300]
+            research.summary = clean_text(reply["research"].get("summary")) or first_sentence(research.description)
             research.why = clean_text(reply["research"].get("why")) or "Notable new research."
         elif research_candidates:
             research = research_candidates[0]
