@@ -573,8 +573,17 @@ def parse_json_reply(text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def first_sentence(text: str, max_chars: int = 140) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"[.!?](\s|$)", text)
+    sentence = text[:match.end()].strip() if match else text
+    return sentence[:max_chars].rstrip() + ("…" if len(sentence) > max_chars else "")
+
+
 def heuristic_text(story: Story) -> None:
-    story.summary = story.summary or story.description[:360] or story.title
+    story.summary = story.summary or first_sentence(story.description) or story.title
     story.why = story.why or "Selected for impact, novelty, and relevance."
 
 
