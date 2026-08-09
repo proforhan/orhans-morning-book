@@ -791,12 +791,19 @@ def chart_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageF
 
 
 def fred_observations(series_id: str, start: str) -> list[tuple[dt.date, float]]:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-    rows = list(csv.DictReader(fetch(url, timeout=45).decode("utf-8-sig").splitlines()))
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        raise RuntimeError("FRED_API_KEY is not set")
+    url = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id={series_id}&api_key={api_key}&file_type=json"
+        f"&observation_start={start}"
+    )
+    payload = json.loads(fetch(url, timeout=45).decode("utf-8"))
     observations: list[tuple[dt.date, float]] = []
-    for row in rows:
+    for row in payload.get("observations", []):
         try:
-            observations.append((dt.date.fromisoformat(row["observation_date"]), float(row[series_id])))
+            observations.append((dt.date.fromisoformat(row["date"]), float(row["value"])))
         except (KeyError, TypeError, ValueError):
             continue
     return observations
