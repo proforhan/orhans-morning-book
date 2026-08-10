@@ -32,5 +32,10 @@
     "featured_mtime": 1785323207.959106,
     "featured_at": "2026-07-29T11:06:50.085547+00:00",
     "featured_signature": "a1ed570f988f0de656219d6df21a33e128a15e64984d22d6c9e00dcac0253cad"
+  },
+  "fred_cpi_inflation": {
+    "featured_mtime": 1786359736.076769,
+    "featured_at": "2026-08-10T11:02:17.776073+00:00",
+    "featured_signature": "3ccad68c4c15054b88c68b0c4b17e55d5f95dc388db2f2094bf0aeee8e6ce5c0"
   }
 }
