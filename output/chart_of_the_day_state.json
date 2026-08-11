@@ -37,5 +37,10 @@
     "featured_mtime": 1786359736.076769,
     "featured_at": "2026-08-10T11:02:17.776073+00:00",
     "featured_signature": "3ccad68c4c15054b88c68b0c4b17e55d5f95dc388db2f2094bf0aeee8e6ce5c0"
+  },
+  "fred_mortgage_30y": {
+    "featured_mtime": 1786446135.582946,
+    "featured_at": "2026-08-11T11:02:18.681033+00:00",
+    "featured_signature": "f44cad8546d762fca291ff9ea565638d8d0089980b8c62117065996c8c54a24a"
   }
 }
