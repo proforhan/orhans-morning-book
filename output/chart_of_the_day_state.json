@@ -42,5 +42,10 @@
     "featured_mtime": 1786446135.582946,
     "featured_at": "2026-08-11T11:02:18.681033+00:00",
     "featured_signature": "f44cad8546d762fca291ff9ea565638d8d0089980b8c62117065996c8c54a24a"
+  },
+  "fred_unemployment": {
+    "featured_mtime": 1786532525.092686,
+    "featured_at": "2026-08-12T11:02:08.435763+00:00",
+    "featured_signature": "ed0734b54c87bc4d5fa5b1e75e0a092b85415c04181b36e420512adfe11151ff"
   }
 }
