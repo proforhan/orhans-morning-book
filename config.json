@@ -61,15 +61,20 @@
   },
   "weather_locations": [
     {
-      "city": "Irving, TX",
-      "latitude": 32.814,
-      "longitude": -96.9489
+            "city": "Dallas, TX",
+            "latitude": 32.7767,
+            "longitude": -96.797
     },
-    {
-      "city": "Dallas, TX",
-      "latitude": 32.7767,
-      "longitude": -96.797
-    }
+        {
+                "city": "New York, NY",
+                "latitude": 40.7128,
+                "longitude": -74.006
+        },
+        {
+                "city": "Chicago, IL",
+                "latitude": 41.8781,
+                "longitude": -87.6298
+        }
   ],
   "chart_sources": [
     {
