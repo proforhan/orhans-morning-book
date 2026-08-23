@@ -52,5 +52,10 @@
     "featured_mtime": 1787223750.401341,
     "featured_at": "2026-08-20T11:02:34.662383+00:00",
     "featured_signature": "7f2a19d981c515076df872cc9c39bfacad588b956cae0d581505a4ba170955ec"
+  },
+  "fred_treasury_10y": {
+    "featured_mtime": 1787482892.654737,
+    "featured_at": "2026-08-23T11:01:34.928750+00:00",
+    "featured_signature": "4f5b1034886a102972e542201fe21e1aeb1c5c2d034acc7ed8ec173cda59a32d"
   }
 }
