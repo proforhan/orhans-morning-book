@@ -936,7 +936,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         if os.name != "nt"
         else now.strftime("%B %#d, %Y, %A")
     )
-    chart_url = weather_chart_url(weather_rows)
+    chart_url = ""
     unavailable = "; ".join(errors[:6])
     source_note = f"<p><small><strong>Source notes:</strong> {esc(unavailable)}</small></p>" if unavailable else ""
 
