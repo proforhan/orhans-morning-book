@@ -97,6 +97,7 @@ jobs:
           # On a manual test run, restrict delivery and preserve rotation state.
           OMI_RECIPIENTS: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_only) && 'orhanerdem@gmail.com' || '' }}
           OMI_PRESERVE_CHART_STATE: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_only) && 'true' || '' }}
+          OMI_BUTTONDOWN_LIVE: ${{ steps.guard.outputs.mark }}
         run: python main.py
 
       - name: Record today's send
