@@ -917,7 +917,7 @@ def section_html(title: str, content: str, empty_message: str = "") -> str:
     return f"""
     <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0">
       <tr>
-        <td bgcolor="#17324D" align="left">
+        <td bgcolor="#17324D" align="left" class="omi-section-title" style="padding:10px 14px;">
           <font face="Arial, sans-serif" color="#FFFFFF" size="4">
             <strong>&nbsp; {esc(title)}</strong>
           </font>
@@ -936,7 +936,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         if os.name != "nt"
         else now.strftime("%B %#d, %Y, %A")
     )
-    chart_url = ""
+    chart_url = weather_chart_url(weather_rows)
     unavailable = "; ".join(errors[:6])
     source_note = f"<p><small><strong>Source notes:</strong> {esc(unavailable)}</small></p>" if unavailable else ""
 
@@ -970,18 +970,18 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
     column_width = f"{100 // len(weather_rows)}%" if weather_rows else "100%"
     for row in weather_rows:
         weather_cells.append(f"""
-        <td width="{column_width}" bgcolor="#EDF3F7" valign="top">
-          <font face="Arial, sans-serif" color="#17324D">
+        <td width="{column_width}" bgcolor="#EDF3F7" valign="top" class="omi-weather-cell" style="padding:14px;">
+          <font face="Arial, sans-serif" color="#17324D" class="omi-weather-text">
             <strong>{esc(row['city'])}</strong><br>
-            <font size="6"><strong>{row['current']}°</strong></font><br>
+            <font size="6" class="omi-temp"><strong>{row['current']}°</strong></font><br>
             {esc(row.get('conditions', ''))}<br>
             H {row['high']}° · L {row['low']}° · Rain {row['rain']}%
           </font>
         </td>""")
     city_names = ", ".join(row["city"] for row in weather_rows)
     weather_table = f"""
-      <table role="presentation" width="100%" border="0" cellspacing="4" cellpadding="10" bgcolor="#DCE7EE">
-      <tr>{''.join(weather_cells)}</tr>
+      <table role="presentation" width="100%" border="0" cellspacing="4" cellpadding="10" bgcolor="#DCE7EE" class="omi-weather-table">
+      <tr class="omi-weather-row">{''.join(weather_cells)}</tr>
       </table>
       {f'''<p align="center"><img src="{esc(chart_url)}" width="480" style="max-width:100%;height:auto"
         alt="Line chart comparing today's forecast temperatures in {esc(city_names)}"></p>''' if chart_url else ''}"""
@@ -1002,28 +1002,60 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
           · Updated {esc(updated_label)}</small></p>'''
 
     return f"""<!doctype html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="format-detection" content="telephone=no">
+<style>
+  body,table,td {{ -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }}
+  img {{ -ms-interpolation-mode:bicubic; }}
+  a {{ text-decoration:none; }}
+  h2,h3 {{ line-height:1.3; margin:14px 0 8px; }}
+  p,blockquote,li {{ line-height:1.55; }}
+  @media only screen and (max-width:620px) {{
+    .omi-wrap {{ width:100% !important; }}
+    .omi-pad {{ padding:14px !important; }}
+    .omi-masthead {{ padding:16px 10px !important; }}
+    .omi-title {{ font-size:26px !important; }}
+    .omi-subtitle {{ font-size:12px !important; }}
+    .omi-navbar {{ font-size:11px !important; padding:8px 4px !important; }}
+    .omi-navbar-text {{ font-size:11px !important; }}
+    .omi-section-title {{ padding:10px 12px !important; }}
+    .omi-section-title font {{ font-size:16px !important; }}
+    .omi-weather-cell {{ padding:8px 4px !important; }}
+    .omi-weather-text {{ font-size:10.5px !important; }}
+    .omi-weather-cell strong {{ font-size:11px !important; }}
+    .omi-temp {{ font-size:22px !important; }}
+    h2 {{ font-size:20px !important; }}
+    h3 {{ font-size:17px !important; }}
+    p, blockquote, li {{ font-size:15px !important; }}
+    blockquote {{ margin:8px 0 !important; padding:8px 10px !important; }}
+    small {{ font-size:12.5px !important; }}
+  }}
+</style>
+</head>
 <body bgcolor="#E7EDF2">
 <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="8" bgcolor="#E7EDF2">
 <tr><td align="center">
-  <table role="presentation" width="680" border="0" cellspacing="0" cellpadding="0" bgcolor="#17324D" style="max-width:100%">
+  <table role="presentation" width="680" border="0" cellspacing="0" cellpadding="0" bgcolor="#17324D" style="max-width:100%" class="omi-wrap">
   <tr><td>
     <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="18" bgcolor="#FAF7F0">
-    <tr><td>
+    <tr><td class="omi-pad">
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="12" bgcolor="#17324D">
-      <tr><td align="center">
-        <font face="Georgia, Times New Roman, serif" color="#FFFFFF" size="6">
+      <tr><td align="center" class="omi-masthead">
+        <font face="Georgia, Times New Roman, serif" color="#FFFFFF" size="6" class="omi-title">
           <strong>{esc(config['newsletter_name'])}</strong>
         </font><br>
-        <font face="Arial, sans-serif" color="#DDE7EF" size="2">
+        <font face="Arial, sans-serif" color="#DDE7EF" size="2" class="omi-subtitle">
           <strong>{esc(date_label)} &nbsp;·&nbsp; MORNING EDITION</strong>
         </font>
       </td></tr>
       </table>
 
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="7" bgcolor="#8A2D3C">
-      <tr><td align="center">
-        <font face="Arial, sans-serif" color="#FFFFFF" size="2">
+      <tr><td align="center" class="omi-navbar">
+        <font face="Arial, sans-serif" color="#FFFFFF" size="2" class="omi-navbar-text">
           WEATHER &nbsp;·&nbsp; TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY
         </font>
       </td></tr>
