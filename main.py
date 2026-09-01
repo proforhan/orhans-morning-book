@@ -99,6 +99,20 @@ RESEARCH_FEEDS = [
     ("AI Conferences", "https://news.google.com/rss/search?q=NeurIPS+OR+ICML+OR+ICLR+OR+%22AI+conference%22+paper+when:3d&hl=en-US&gl=US&ceid=US:en"),
 ]
 
+# Used only when none of the tracked local/FRED charts have anything newly
+# updated to feature (see select_fallback_chart). These are outlets whose
+# posts are built around a chart or graphic, so a story pulled from here is
+# likely to actually be chart-led rather than just illustrated with one.
+FALLBACK_CHART_FEEDS = [
+    ("The Economist: Graphic Detail", "https://www.economist.com/graphic-detail/rss.xml"),
+    ("Visual Capitalist", "https://www.visualcapitalist.com/feed/"),
+    ("Our World in Data", "https://ourworldindata.org/atom.xml"),
+    ("Reuters Graphics", "https://news.google.com/rss/search?q=site:reuters.com+(graphic+OR+%22in+charts%22)+when:4d&hl=en-US&gl=US&ceid=US:en"),
+    ("Axios Visuals", "https://news.google.com/rss/search?q=site:axios.com+chart+when:4d&hl=en-US&gl=US&ceid=US:en"),
+]
+
+CHART_KEYWORDS = ("chart", "charts", "graphic", "data show", "in numbers", "visualized", "infographic")
+
 
 @dataclass
 class Story:
@@ -849,8 +863,39 @@ def select_chart_of_the_day(config: dict[str, Any]) -> dict[str, Any] | None:
     ) if candidates else None
 
 
+def select_fallback_chart(now: dt.datetime, errors: list[str]) -> dict[str, Any] | None:
+    """Chart of the Day fallback for when nothing tracked has anything new.
+
+    Looks at a short list of outlets whose posts are themselves built around
+    a chart or graphic (rather than general news that happens to include an
+    image), and features the most recent, most clearly chart-led one with an
+    image, clearly labelled in the newsletter as spotted-in-coverage rather
+    than one of the tracked series.
+    """
+    candidates = recent(deduplicate(collect(FALLBACK_CHART_FEEDS, errors)), now, 96)
+    with_image = [item for item in candidates if item.image_url]
+    if not with_image:
+        return None
+    for item in with_image:
+        text = f"{item.title} {item.description}".lower()
+        item.score = rank(item, now) + (10 if any(k in text for k in CHART_KEYWORDS) else 0)
+    with_image.sort(key=lambda item: item.score, reverse=True)
+    best = with_image[0]
+    return {
+        "id": "fallback",
+        "title": best.title,
+        "image_url": best.image_url,
+        "caption": best.description[:280] or best.title,
+        "explanation": "",
+        "source": best.source,
+        "source_url": best.link,
+        "updated_at": now.isoformat(),
+        "is_fallback": True,
+    }
+
+
 def mark_chart_featured(chart: dict[str, Any] | None) -> None:
-    if not chart:
+    if not chart or chart.get("is_fallback") or "updated_mtime" not in chart:
         return
     state = load_chart_state()
     state[chart["id"]] = {
@@ -992,14 +1037,25 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
             ZoneInfo(config["timezone"])
         )
         updated_label = updated.strftime("%B %#d, %Y") if os.name == "nt" else updated.strftime("%B %-d, %Y")
+        is_fallback = bool(chart_of_day.get("is_fallback"))
+        image_src = esc(chart_of_day["image_url"]) if is_fallback else "cid:chart-of-the-day"
+        fallback_note = (
+            '''<table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="6" bgcolor="#EDE6D6">
+          <tr><td>
+            <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; NO TRACKED CHART UPDATED TODAY · SPOTTED IN COVERAGE</strong></font>
+          </td></tr>
+          </table>'''
+            if is_fallback else ""
+        )
         chart_html = f'''
+          {fallback_note}
           <h3>{esc(chart_of_day["title"])}</h3>
-          <p align="center"><img src="cid:chart-of-the-day" width="600" style="max-width:100%;height:auto"
+          <p align="center"><img src="{image_src}" width="600" style="max-width:100%;height:auto"
              alt="{esc(chart_of_day["title"])}"></p>
           <p>{esc(chart_of_day.get("explanation") or chart_of_day["caption"])}</p>
           <p><small><strong>Source:</strong> {esc(chart_of_day["source"])}
           {f'· <a href="{esc(chart_of_day["source_url"])}">View source</a>' if chart_of_day.get("source_url") else ''}
-          · Updated {esc(updated_label)}</small></p>'''
+          · {"Found" if is_fallback else "Updated"} {esc(updated_label)}</small></p>'''
 
     return f"""<!doctype html>
 <html><head>
@@ -1143,7 +1199,8 @@ def buttondown_upload_image(api_key: str, image_path: Path) -> str:
     return result["image"]
 
 
-def send_via_buttondown(config: dict[str, Any], subject: str, body: str) -> None:
+def send_via_buttondown(config: dict[str, Any], subject: str, body: str,
+                        chart_of_day: dict[str, Any] | None = None) -> None:
     """Deliver the newsletter through Buttondown instead of Gmail SMTP.
 
     Buttondown owns the subscriber list (and unsubscribe handling) for
@@ -1153,12 +1210,17 @@ def send_via_buttondown(config: dict[str, Any], subject: str, body: str) -> None
     delivery within a few minutes) when OMI_BUTTONDOWN_LIVE is set truthy.
     This keeps test_delivery.ps1 from ever emailing real subscribers while
     still letting the scheduled daily run go out automatically.
+
+    chart_of_day, when given, is the chart already resolved by build() (which
+    may be a fallback chart pulled from coverage rather than a tracked local
+    source) - reusing it here keeps the sent email consistent with what was
+    generated instead of re-resolving independently.
     """
     api_key = os.getenv("BUTTONDOWN_API_KEY")
     if not api_key:
         raise RuntimeError("Set BUTTONDOWN_API_KEY to enable Buttondown delivery.")
 
-    chart = select_chart_of_the_day(config)
+    chart = chart_of_day if chart_of_day is not None else select_chart_of_the_day(config)
     if chart and "cid:chart-of-the-day" in body:
         try:
             hosted_url = buttondown_upload_image(api_key, Path(chart["image_path"]))
@@ -1286,6 +1348,8 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         top = top[:10 - (1 if leader_post else 0)]
 
     chart_of_day = select_chart_of_the_day(config)
+    if not chart_of_day:
+        chart_of_day = select_fallback_chart(now, errors)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
                   research_items, chart_of_day, errors)
     OUTPUT.mkdir(exist_ok=True)
@@ -1331,7 +1395,7 @@ def main() -> int:
         )},
     }, indent=2))
     if not args.no_send:
-        send_via_buttondown(load_config(), subject, body)
+        send_via_buttondown(load_config(), subject, body, manifest.get("chart_of_the_day"))
     return 0
 
 
