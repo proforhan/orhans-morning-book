@@ -146,6 +146,15 @@ def clean_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def shorten_title(title: str, limit: int = 70) -> str:
+    """Trim an over-long headline to a word boundary, adding an ellipsis."""
+    title = title.strip()
+    if len(title) <= limit:
+        return title
+    truncated = title[:limit].rsplit(" ", 1)[0].rstrip(",.;:-\u2013\u2014 ")
+    return f"{truncated}\u2026" if truncated else f"{title[:limit].rstrip()}\u2026"
+
+
 def child_text(node: ET.Element, names: tuple[str, ...]) -> str:
     for child in node.iter():
         if child.tag.split("}")[-1].lower() in names and child.text:
@@ -534,7 +543,6 @@ def weather(city: str, lat: float, lon: float, timezone: str) -> dict[str, Any]:
         "temperature_unit": "fahrenheit", "precipitation_unit": "inch",
         "current": "temperature_2m,weather_code",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
-        "hourly": "temperature_2m,precipitation_probability",
         "forecast_days": 1,
     })
     data = json.loads(fetch(f"https://api.open-meteo.com/v1/forecast?{query}"))
@@ -552,46 +560,11 @@ def weather(city: str, lat: float, lon: float, timezone: str) -> dict[str, Any]:
         "low": round(data["daily"]["temperature_2m_min"][0]),
         "rain": data["daily"]["precipitation_probability_max"][0],
         "conditions": labels.get(code, "Mixed conditions"),
-        "hourly_time": data["hourly"]["time"],
-        "hourly_temp": [round(x) for x in data["hourly"]["temperature_2m"]],
-        "hourly_rain": data["hourly"]["precipitation_probability"],
     }
 
 
 def esc(value: Any) -> str:
     return html.escape(str(value), quote=True)
-
-
-def weather_chart_url(weather_rows: list[dict[str, Any]]) -> str:
-    if not weather_rows or any("hourly_time" not in row for row in weather_rows):
-        return ""
-    labels = [dt.datetime.fromisoformat(x).strftime("%-I %p") if os.name != "nt"
-              else dt.datetime.fromisoformat(x).strftime("%#I %p")
-              for x in weather_rows[0]["hourly_time"][6:22:3]]
-    datasets = []
-    colors = ["#174f78", "#b44b3e", "#5b8c3e", "#8a5ba0", "#c98a2c"]
-    for index, row in enumerate(weather_rows):
-        datasets.append({
-            "label": row["city"],
-            "data": row["hourly_temp"][6:22:3],
-            "borderColor": colors[index % len(colors)],
-            "backgroundColor": "transparent",
-            "fill": False,
-            "lineTension": 0.25,
-        })
-    chart = {
-        "type": "line",
-        "data": {"labels": labels, "datasets": datasets},
-        "options": {
-            "legend": {"position": "bottom"},
-            "title": {"display": True, "text": "Today's temperature outlook (°F)"},
-            "scales": {"yAxes": [{"ticks": {"beginAtZero": False}}]},
-        },
-    }
-    return "https://quickchart.io/chart?" + urllib.parse.urlencode({
-        "width": 480, "height": 190, "backgroundColor": "white",
-        "c": json.dumps(chart, separators=(",", ":")),
-    })
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +892,7 @@ def story_html(story: Story, number: int | None = None, show_image: bool = False
             f'<br><small>Source visual: {esc(story.source)}</small></p>'
         )
     return f"""
-      <h3>{label}<a href="{esc(story.link)}">{esc(story.title)}</a></h3>
+      <h3>{label}<a href="{esc(story.link)}">{esc(shorten_title(story.title))}</a></h3>
       {visual}
       <p>{esc(story.summary or story.description or story.title)}</p>
       <blockquote><strong>Why it matters:</strong> {esc(story.why or "Selected for impact and relevance.")}</blockquote>
@@ -938,19 +911,14 @@ def leader_html(post: Story, number: int, timezone: str) -> str:
     if post.published:
         local = post.published.astimezone(ZoneInfo(timezone))
         time_label = local.strftime("%#I:%M %p, %B %#d" if os.name == "nt" else "%-I:%M %p, %B %-d")
-    via_label = {
-        "X": "Post on X",
-        "own publication": "New publication",
-        "press coverage": "In the news (direct post access unavailable)",
-    }.get(post.via, "Public post")
     return f"""
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="6" bgcolor="#EDE6D6">
       <tr><td>
-        <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; THOUGHT LEADERS MONITOR · {esc(via_label.upper())}</strong></font>
+        <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; THOUGHT LEADERS MONITOR</strong></font>
       </td></tr>
       </table>
       <h3>{number}. <a href="{esc(post.link)}">{esc(post.source)}</a></h3>
-      <blockquote>{esc(post.summary or post.title)}</blockquote>
+      <blockquote>{esc(shorten_title(post.summary or post.title, 140))}</blockquote>
       {visual}
       <p><small>{esc(time_label)}{" · " if time_label else ""}<a href="{esc(post.link)}">View original →</a>
       · <a href="{esc(post.link if post.via == "X" else "https://x.com/" + post.source.split("(@")[-1].rstrip(")"))}">Profile on X</a></small></p>
@@ -962,7 +930,7 @@ def section_html(title: str, content: str, empty_message: str = "") -> str:
     return f"""
     <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0">
       <tr>
-        <td bgcolor="#17324D" align="left" class="omi-section-title" style="padding:10px 14px;">
+        <td bgcolor="#17324D" align="left" class="omi-section-title" style="padding:8px 12px;">
           <font face="Arial, sans-serif" color="#FFFFFF" size="4">
             <strong>&nbsp; {esc(title)}</strong>
           </font>
@@ -981,7 +949,6 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         if os.name != "nt"
         else now.strftime("%B %#d, %Y, %A")
     )
-    chart_url = weather_chart_url(weather_rows)
     unavailable = "; ".join(errors[:6])
     source_note = f"<p><small><strong>Source notes:</strong> {esc(unavailable)}</small></p>" if unavailable else ""
 
@@ -1015,7 +982,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
     column_width = f"{100 // len(weather_rows)}%" if weather_rows else "100%"
     for row in weather_rows:
         weather_cells.append(f"""
-        <td width="{column_width}" bgcolor="#EDF3F7" valign="top" class="omi-weather-cell" style="padding:14px;">
+        <td width="{column_width}" bgcolor="#EDF3F7" valign="top" class="omi-weather-cell" style="padding:10px;">
           <font face="Arial, sans-serif" color="#17324D" class="omi-weather-text">
             <strong>{esc(row['city'])}</strong><br>
             <font size="6" class="omi-temp"><strong>{row['current']}°</strong></font><br>
@@ -1023,13 +990,10 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
             H {row['high']}° · L {row['low']}° · Rain {row['rain']}%
           </font>
         </td>""")
-    city_names = ", ".join(row["city"] for row in weather_rows)
     weather_table = f"""
       <table role="presentation" width="100%" border="0" cellspacing="4" cellpadding="10" bgcolor="#DCE7EE" class="omi-weather-table">
       <tr class="omi-weather-row">{''.join(weather_cells)}</tr>
-      </table>
-      {f'''<p align="center"><img src="{esc(chart_url)}" width="480" style="max-width:100%;height:auto"
-        alt="Line chart comparing today's forecast temperatures in {esc(city_names)}"></p>''' if chart_url else ''}"""
+      </table>"""
 
     chart_html = ""
     if chart_of_day:
@@ -1049,7 +1013,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         )
         chart_html = f'''
           {fallback_note}
-          <h3>{esc(chart_of_day["title"])}</h3>
+          <h3>{esc(shorten_title(chart_of_day["title"]))}</h3>
           <p align="center"><img src="{image_src}" width="600" style="max-width:100%;height:auto"
              alt="{esc(chart_of_day["title"])}"></p>
           <p>{esc(chart_of_day.get("explanation") or chart_of_day["caption"])}</p>
@@ -1067,27 +1031,31 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
   body,table,td {{ -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }}
   img {{ -ms-interpolation-mode:bicubic; }}
   a {{ text-decoration:none; }}
-  h2,h3 {{ line-height:1.3; margin:14px 0 8px; }}
-  p,blockquote,li {{ line-height:1.55; }}
+  h2,h3 {{ line-height:1.25; margin:8px 0 4px; }}
+  p {{ line-height:1.4; margin:4px 0; }}
+  blockquote {{ line-height:1.4; margin:4px 0 6px; padding:6px 10px; }}
+  li {{ line-height:1.4; }}
+  hr {{ margin:6px 0 12px; border:none; border-top:1px solid #E0DCD2; }}
   @media only screen and (max-width:620px) {{
     .omi-wrap {{ width:100% !important; }}
-    .omi-pad {{ padding:14px !important; }}
-    .omi-masthead {{ padding:16px 10px !important; }}
-    .omi-title {{ font-size:26px !important; }}
-    .omi-subtitle {{ font-size:12px !important; }}
-    .omi-navbar {{ font-size:11px !important; padding:8px 4px !important; }}
-    .omi-navbar-text {{ font-size:11px !important; }}
-    .omi-section-title {{ padding:10px 12px !important; }}
-    .omi-section-title font {{ font-size:16px !important; }}
-    .omi-weather-cell {{ padding:8px 4px !important; }}
-    .omi-weather-text {{ font-size:10.5px !important; }}
-    .omi-weather-cell strong {{ font-size:11px !important; }}
-    .omi-temp {{ font-size:22px !important; }}
-    h2 {{ font-size:20px !important; }}
-    h3 {{ font-size:17px !important; }}
-    p, blockquote, li {{ font-size:15px !important; }}
-    blockquote {{ margin:8px 0 !important; padding:8px 10px !important; }}
-    small {{ font-size:12.5px !important; }}
+    .omi-pad {{ padding:10px !important; }}
+    .omi-masthead {{ padding:12px 8px !important; }}
+    .omi-title {{ font-size:20px !important; }}
+    .omi-subtitle {{ font-size:10px !important; }}
+    .omi-navbar {{ font-size:9.5px !important; padding:6px 4px !important; }}
+    .omi-navbar-text {{ font-size:9.5px !important; }}
+    .omi-section-title {{ padding:7px 10px !important; }}
+    .omi-section-title font {{ font-size:14px !important; }}
+    .omi-weather-cell {{ padding:6px 4px !important; }}
+    .omi-weather-text {{ font-size:9.5px !important; }}
+    .omi-weather-cell strong {{ font-size:10px !important; }}
+    .omi-temp {{ font-size:18px !important; }}
+    h2 {{ font-size:16px !important; }}
+    h3 {{ font-size:14px !important; }}
+    p, blockquote, li {{ font-size:12.5px !important; }}
+    blockquote {{ margin:4px 0 !important; padding:6px 8px !important; }}
+    small {{ font-size:10.5px !important; }}
+    hr {{ margin:4px 0 8px !important; }}
   }}
 </style>
 </head>
@@ -1129,7 +1097,7 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#17324D">
       <tr><td align="center">
         <font face="Arial, sans-serif" color="#FFFFFF" size="2">
-          <strong>ORHAN'S MORNING INTELLIGENCE</strong> &nbsp;·&nbsp; A PERSONAL FIVE-MINUTE BRIEFING
+          <strong>A PERSONAL FIVE-MINUTE BRIEFING</strong>
         </font>
       </td></tr>
       </table>
