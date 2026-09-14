@@ -127,7 +127,7 @@ class Story:
     image_url: str = ""
     image_alt: str = ""
     kind: str = "news"   # news | leader | research
-    via: str = ""        # e.g. "X via Nitter", "Substack", "press coverage"
+    via: str = ""        # e.g. "own publication", "press coverage"
 
 
 def load_config() -> dict[str, Any]:
@@ -307,20 +307,17 @@ def select_diverse(stories: list[Story], limit: int, per_category: int = 3,
 # Thought Leaders Monitor
 # ---------------------------------------------------------------------------
 
-def original_x_url(link: str, handle: str) -> str:
-    match = re.search(r"/status/(\d+)", link)
-    username = handle.lstrip("@")
-    return f"https://x.com/{username}/status/{match.group(1)}" if match else f"https://x.com/{username}"
-
-
 def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
                             errors: list[str]) -> tuple[list[Story], list[str]]:
     """Best recent public item per configured leader, plus availability notes.
 
     Source priority per leader:
-      1. Direct X posts via public Nitter mirrors (when reachable).
-      2. The leader's own publication feeds (Substack, CFR blog, ...).
-      3. Google News coverage of the leader, clearly labelled as coverage.
+      1. The leader's own publication feeds (Substack, CFR blog, ...).
+      2. Google News coverage of the leader, clearly labelled as coverage.
+
+    (Direct X sourcing via public Nitter mirrors was removed: it required a
+    `nitter_instances` config key that was never actually populated, so that
+    tier silently never ran - see the 2026-09 codebase review.)
     """
     cutoff = now.astimezone(dt.timezone.utc) - dt.timedelta(hours=26)
     candidates: list[Story] = []
@@ -328,41 +325,22 @@ def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
     for leader in config.get("thought_leaders", []):
         handle = leader.get("handle", "")
         name = leader.get("name", handle)
-        username = handle.lstrip("@")
         leader_posts: list[Story] = []
 
-        # 1. X via Nitter mirrors.
-        for instance in config.get("nitter_instances", []):
+        # 1. Own publications (Substack, blogs).
+        for feed_url in leader.get("feeds", []):
             try:
-                posts = parse_feed(name, f"{instance}/{urllib.parse.quote(username)}/rss")
-            except Exception:
+                posts = parse_feed(name, feed_url)
+            except Exception as exc:
+                errors.append(f"Thought leader {handle} ({feed_url}): {type(exc).__name__}")
                 continue
             for post in posts:
                 if post.published and post.published.astimezone(dt.timezone.utc) < cutoff:
                     continue
-                if post.title.startswith("RT by "):
-                    continue
-                post.title = re.sub(r"^R to @[^:]+:\s*", "", post.title).strip()
-                post.link = original_x_url(post.link, handle)
-                post.via = "X"
+                post.via = "own publication"
                 leader_posts.append(post)
-            if leader_posts:
-                break
 
-        # 2. Own publications (Substack, blogs).
-        if not leader_posts:
-            for feed_url in leader.get("feeds", []):
-                try:
-                    posts = parse_feed(name, feed_url)
-                except Exception:
-                    continue
-                for post in posts:
-                    if post.published and post.published.astimezone(dt.timezone.utc) < cutoff:
-                        continue
-                    post.via = "own publication"
-                    leader_posts.append(post)
-
-        # 3. Press coverage as a clearly-labelled fallback.
+        # 2. Press coverage as a clearly-labelled fallback.
         if not leader_posts and leader.get("news_query"):
             query = urllib.parse.quote(leader["news_query"])
             try:
@@ -384,7 +362,7 @@ def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
                 post.source = f"{name} ({handle})"
                 post.summary = post.title
                 post.score = rank(post, now) + (4 if post.image_url else 0) + (
-                    10 if post.via == "X" else 6 if post.via == "own publication" else 0
+                    6 if post.via == "own publication" else 0
                 )
             candidates.append(max(leader_posts, key=lambda post: post.score))
         else:
@@ -755,10 +733,19 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
         "source": source,
         "source_url": source_url,
         "priority": priority,
+        # Content signature: on ephemeral GitHub Actions runners, output/ is
+        # gitignored and never persists between runs, so chart_path and
+        # metadata_path are rebuilt fresh every single run. That means their
+        # file mtimes are useless for "has this been featured yet" (the
+        # image is always written a moment before its own metadata, which
+        # used to make select_chart_of_the_day() treat every freshly-built
+        # chart as instantly stale and skip it). Featuring a data release
+        # exactly once has to key on the data itself, not on file timestamps.
+        "signature": metadata["data_signature"],
     }
 
 
-def fred_chart_sources() -> list[dict[str, Any]]:
+def fred_chart_sources(errors: list[str]) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     builders = [
         dict(series_id="GDP", chart_id="fred_gdp_growth",
@@ -800,18 +787,42 @@ def fred_chart_sources() -> list[dict[str, Any]]:
             built = build_fred_chart(**kwargs)
             if built:
                 sources.append(built)
-        except Exception:
+        except Exception as exc:
+            errors.append(f"FRED chart {kwargs['chart_id']}: {type(exc).__name__}")
             continue
     return sources
 
 
-def select_chart_of_the_day(config: dict[str, Any]) -> dict[str, Any] | None:
+def select_chart_of_the_day(config: dict[str, Any], errors: list[str]) -> dict[str, Any] | None:
     state = load_chart_state()
     candidates: list[dict[str, Any]] = []
     sources = [{**source, "priority": source.get("priority", 100)}
                for source in config.get("chart_sources", [])]
-    sources.extend(fred_chart_sources())
+    sources.extend(fred_chart_sources(errors))
+    now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
     for source in sources:
+        # Content-signature sources (FRED charts, built fresh every run) do
+        # not rely on file modification times: output/ is gitignored and
+        # never persists between GitHub Actions runs, so the image and
+        # metadata files are always brand-new and their mtimes carry no
+        # information about whether this data was already featured. Feature
+        # once per distinct data value instead, tracked by "signature".
+        signature = source.get("signature")
+        if signature is not None:
+            if not Path(source["image_path"]).is_file():
+                continue
+            if state.get(source["id"], {}).get("featured_signature") == signature:
+                continue
+            candidates.append({
+                **source,
+                "updated_at": dt.datetime.fromtimestamp(now_ts, dt.timezone.utc).isoformat(),
+                "updated_mtime": now_ts,
+            })
+            continue
+
+        # Local-file sources: a trigger_path (e.g. a synced .gsheet pointer)
+        # updating is the signal that new data arrived; only feature once the
+        # corresponding image has caught up (image newer than its trigger).
         image_path = Path(source["image_path"])
         trigger_path = Path(source.get("trigger_path", source["image_path"]))
         if not image_path.is_file() or not trigger_path.exists():
@@ -871,10 +882,12 @@ def mark_chart_featured(chart: dict[str, Any] | None) -> None:
     if not chart or chart.get("is_fallback") or "updated_mtime" not in chart:
         return
     state = load_chart_state()
-    state[chart["id"]] = {
-        "featured_mtime": chart["updated_mtime"],
-        "featured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-    }
+    entry = {"featured_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    if chart.get("signature") is not None:
+        entry["featured_signature"] = chart["signature"]
+    else:
+        entry["featured_mtime"] = chart["updated_mtime"]
+    state[chart["id"]] = entry
     CHART_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
@@ -921,7 +934,7 @@ def leader_html(post: Story, number: int, timezone: str) -> str:
       <blockquote>{esc(shorten_title(post.summary or post.title, 140))}</blockquote>
       {visual}
       <p><small>{esc(time_label)}{" · " if time_label else ""}<a href="{esc(post.link)}">View original →</a>
-      · <a href="{esc(post.link if post.via == "X" else "https://x.com/" + post.source.split("(@")[-1].rstrip(")"))}">Profile on X</a></small></p>
+      · <a href="{esc("https://x.com/" + post.source.split("(@")[-1].rstrip(")"))}">Profile on X</a></small></p>
       <hr>"""
 
 
@@ -1188,7 +1201,7 @@ def send_via_buttondown(config: dict[str, Any], subject: str, body: str,
     if not api_key:
         raise RuntimeError("Set BUTTONDOWN_API_KEY to enable Buttondown delivery.")
 
-    chart = chart_of_day if chart_of_day is not None else select_chart_of_the_day(config)
+    chart = chart_of_day if chart_of_day is not None else select_chart_of_the_day(config, [])
     if chart and "cid:chart-of-the-day" in body:
         try:
             hosted_url = buttondown_upload_image(api_key, Path(chart["image_path"]))
@@ -1244,7 +1257,7 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
     msg["Subject"] = subject
     msg.set_content("Orhan's Morning Intelligence is best viewed as HTML.")
     msg.add_alternative(body, subtype="html")
-    chart = select_chart_of_the_day(config)
+    chart = select_chart_of_the_day(config, [])
     if chart and "cid:chart-of-the-day" in body:
         image_path = Path(chart["image_path"])
         subtype = image_path.suffix.lower().lstrip(".")
@@ -1315,7 +1328,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     if total_items > 10:
         top = top[:10 - (1 if leader_post else 0)]
 
-    chart_of_day = select_chart_of_the_day(config)
+    chart_of_day = select_chart_of_the_day(config, errors)
     if not chart_of_day:
         chart_of_day = select_fallback_chart(now, errors)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
