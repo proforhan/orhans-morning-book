@@ -7,58 +7,9 @@
   "timezone": "America/Chicago",
   "lookback_hours": 30,
   "top_news_items": 6,
-  "max_research_stories": 1,
   "claude_model": "claude-sonnet-4-6",
   "claude_max_tokens": 4000,
   "ft_feed": "https://www.ft.com/myft/following/1579c2fc-7580-4a63-869f-c7b932346645.rss",
-  "walmart_sheet": {
-    "csv_url": "https://docs.google.com/spreadsheets/d/1qOdMjkWm0JccWKO6gTpHF5wDVZE3MuQj6oKXnURuKVk/gviz/tq?tqx=out:csv&sheet=Walmart%20Basket",
-    "title": "Walmart Basket Price Index",
-    "source_url": "https://docs.google.com/spreadsheets/d/1qOdMjkWm0JccWKO6gTpHF5wDVZE3MuQj6oKXnURuKVk/edit",
-    "priority": 20
-  },
-  "zillow": {
-    "csv_url": "https://files.zillowstatic.com/research/public_csvs/zhvi/City_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
-    "title": "Texas Home Prices: Selected Cities",
-    "source_url": "https://www.zillow.com/research/data/",
-    "state": "TX",
-    "cities": [
-      "Dallas",
-      "Frisco",
-      "Irving",
-      "Plano"
-    ],
-    "years": 10,
-    "priority": 15
-  },
-  "zillow_metros": {
-    "csv_url": "https://files.zillowstatic.com/research/public_csvs/zhvi/City_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
-    "title": "U.S. Home Prices: Major Metro Areas",
-    "source_url": "https://www.zillow.com/research/data/",
-    "years": 10,
-    "priority": 14,
-    "cities": [
-      { "name": "New York", "state": "NY" },
-      { "name": "Los Angeles", "state": "CA" },
-      { "name": "Chicago", "state": "IL" },
-      { "name": "Houston", "state": "TX" },
-      { "name": "Phoenix", "state": "AZ" },
-      { "name": "Miami", "state": "FL" }
-    ]
-  },
-  "gdp_per_capita": {
-    "enabled": true,
-    "indicator": "NY.GDP.PCAP.CD",
-    "regions": [
-      "World",
-      "Africa",
-      "Asia",
-      "Europe",
-      "Americas",
-      "Oceania"
-    ],
-    "priority": 5
-  },
   "weather_locations": [
     {
             "city": "Dallas, TX",
@@ -76,29 +27,7 @@
                 "longitude": -87.6298
         }
   ],
-  "chart_sources": [
-    {
-      "id": "walmart_inflation",
-      "title": "Walmart Basket Price Index",
-      "image_path": "C:\\Users\\orhan\\My Drive\\My papers and works\\Walmart Shopping Cart\\Walmart_Inflation_Tracker.png",
-      "trigger_path": "C:\\Users\\orhan\\My Drive\\My papers and works\\Walmart Shopping Cart\\Walmart Inflation Tracker.gsheet",
-      "caption": "Monthly price movement in the tracked Walmart shopping basket.",
-      "explanation": "The index tracks how the cost of a consistent Walmart basket changes over time. It offers a household-level view of price pressure that can be compared with broader inflation measures.",
-      "source": "Walmart Inflation Tracker",
-      "priority": 20
-    },
-    {
-      "id": "zillow_texas",
-      "title": "Texas Home Prices: Selected Cities",
-      "image_path": "C:\\Users\\orhan\\My Drive\\Data\\US\\Real Estate\\Zillow\\TX house prices agent\\output\\TX_Selected_Cities_10Y_Home_Prices.png",
-      "trigger_path": "C:\\Users\\orhan\\My Drive\\Data\\US\\Real Estate\\Zillow\\TX house prices agent\\output\\TX_Selected_Cities_10Y_Home_Prices.png",
-      "caption": "Ten-year Zillow Home Value Index trends for selected Texas cities.",
-      "explanation": "The chart compares the long-run path of typical home values across selected Texas cities, including Dallas, Frisco, Irving, and Plano. The latest movement shows where housing momentum is strengthening, cooling, or diverging across local markets.",
-      "source": "Zillow Research",
-      "source_url": "https://www.zillow.com/research/data/",
-      "priority": 15
-    }
-  ],
+  "chart_sources": [],
   "thought_leaders": [
     {
       "name": "Adam Tooze",
@@ -118,17 +47,5 @@
       ],
       "news_query": "\"Brad Setser\" when:2d"
     }
-  ],
-  "zumper_rent": {
-    "report_url": "https://www.zumper.com/rent-research/national-rent-report",
-    "cities": [
-      "New York",
-      "San Francisco",
-      "Chicago",
-      "Houston",
-      "Dallas",
-      "Austin",
-      "San Antonio"
-    ]
-  }
+  ]
 }
