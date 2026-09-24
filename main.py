@@ -1,4 +1,4 @@
-"""Orhan's Morning Intelligence.
+"""Orhan's Morning Brief.
 
 Daily, mobile-friendly morning newsletter covering AI, economics and finance,
 technology, science, academic research, medicine, and limited major
@@ -479,7 +479,7 @@ def claude_curate(
         "research_candidates": pack(research_candidates, 10),
     }
     prompt = (
-        "You are the editor of 'Orhan's Morning Intelligence', a concise daily briefing for a "
+        f"You are the editor of '{config['newsletter_name']}', a concise daily briefing for a "
         "university professor interested in AI, economics, finance, technology, science, academic "
         "research, medicine, and the football World Cup. Rank by Impact x Novelty x Relevance, "
         "weighting relevance heavily toward AI, economics, finance, academic research, and "
@@ -1239,10 +1239,10 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
     if not user or not password:
         raise RuntimeError("Set GMAIL_USER and GMAIL_APP_PASSWORD to enable SMTP delivery.")
     msg = EmailMessage()
-    msg["From"] = f"Orhan's Morning Intelligence <{user}>"
+    msg["From"] = f"{config['newsletter_name']} <{user}>"
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
-    msg.set_content("Orhan's Morning Intelligence is best viewed as HTML.")
+    msg.set_content(f"{config['newsletter_name']} is best viewed as HTML.")
     msg.add_alternative(body, subtype="html")
     chart = select_chart_of_the_day(config)
     if chart and "cid:chart-of-the-day" in body:
@@ -1345,11 +1345,41 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         if os.name == "nt"
         else now.strftime("%B %-d, %Y")
     )
-    return dated, f"{config['newsletter_name']} | {date_label}", manifest
+    return dated, make_subject(config, top, date_label), manifest
+
+
+# Trailing source tags that feeds append to headlines, e.g. " - Reuters", " | Financial Times".
+# Only a short run of capitalized words after " - " or " | " counts, so a real
+# clause after an em dash ("... jump 8% — the strongest since 2024") is kept.
+_SOURCE_SUFFIX = re.compile(
+    r"\s+[-|]\s+(?:[A-Z][\w&.'\u2019]*(?:\s+(?:of|the|[A-Z][\w&.'\u2019]*)){0,3}"
+    r"|[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|news|co|io|in|uk))$"
+)
+_BYLINE_SUFFIX = re.compile(r"\s+By\s+[A-Z][\w&.]*(?:\s+[A-Z][\w&.]*)?$")
+
+
+def make_subject(config: dict[str, Any], top: list[Story], date_label: str) -> str:
+    """Subject line = the day's lead story, so the inbox shows what is new.
+
+    Buttondown already prints the newsletter name and date under the title,
+    and the email's masthead shows the name again, so repeating the name in
+    the subject made it appear three times. Falls back to "Name | Date" when
+    there is no lead story.
+    """
+    fallback = f"{config['newsletter_name']} | {date_label}"
+    if not top or not (top[0].title or "").strip():
+        return fallback
+    headline = " ".join(re.sub(r"[\u200b-\u200d\ufeff]", "", top[0].title).split())
+    trimmed = _BYLINE_SUFFIX.sub("", _SOURCE_SUFFIX.sub("", headline)).strip()
+    if len(trimmed) >= 20:
+        headline = trimmed
+    if len(headline) > 110:
+        headline = headline[:107].rsplit(" ", 1)[0].rstrip(",;:-") + "…"
+    return headline
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Intelligence.")
+    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Brief.")
     parser.add_argument("--no-send", action="store_true", help="Generate files without sending email.")
     parser.add_argument("--no-ai", action="store_true", help="Use feed descriptions instead of Claude summaries.")
     args = parser.parse_args()
