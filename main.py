@@ -761,10 +761,11 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
         "source": source,
         "source_url": source_url,
         "priority": priority,
+        "signature": metadata["data_signature"],
     }
 
 
-def fred_chart_sources() -> list[dict[str, Any]]:
+def fred_chart_sources(errors: list[str] | None = None) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     builders = [
         dict(series_id="GDP", chart_id="fred_gdp_growth",
@@ -806,17 +807,20 @@ def fred_chart_sources() -> list[dict[str, Any]]:
             built = build_fred_chart(**kwargs)
             if built:
                 sources.append(built)
-        except Exception:
+        except Exception as exc:
+            if errors is not None:
+                errors.append(f"FRED {kwargs['chart_id']}: {type(exc).__name__}")
             continue
     return sources
 
 
-def select_chart_of_the_day(config: dict[str, Any]) -> dict[str, Any] | None:
+def select_chart_of_the_day(config: dict[str, Any],
+                            errors: list[str] | None = None) -> dict[str, Any] | None:
     state = load_chart_state()
     candidates: list[dict[str, Any]] = []
     sources = [{**source, "priority": source.get("priority", 100)}
                for source in config.get("chart_sources", [])]
-    sources.extend(fred_chart_sources())
+    sources.extend(fred_chart_sources(errors))
     for source in sources:
         image_path = Path(source["image_path"])
         trigger_path = Path(source.get("trigger_path", source["image_path"]))
@@ -824,12 +828,21 @@ def select_chart_of_the_day(config: dict[str, Any]) -> dict[str, Any] | None:
             continue
         image_mtime = image_path.stat().st_mtime
         trigger_mtime = trigger_path.stat().st_mtime
-        if trigger_path != image_path and image_mtime < trigger_mtime:
-            continue
-        updated_at = max(image_mtime, trigger_mtime)
-        last_featured = float(state.get(source["id"], {}).get("featured_mtime", 0))
-        if updated_at <= last_featured:
-            continue
+        signature = source.get("signature")
+        if signature:
+            # Charts rebuilt fresh on every run (FRED): file mtimes are always
+            # "now" on an ephemeral runner, so key "already featured" on the
+            # data itself, not on timestamps.
+            if state.get(source["id"], {}).get("featured_signature") == signature:
+                continue
+            updated_at = image_mtime
+        else:
+            if trigger_path != image_path and image_mtime < trigger_mtime:
+                continue
+            updated_at = max(image_mtime, trigger_mtime)
+            last_featured = float(state.get(source["id"], {}).get("featured_mtime", 0))
+            if updated_at <= last_featured:
+                continue
         candidates.append({
             **source,
             "updated_at": dt.datetime.fromtimestamp(updated_at, dt.timezone.utc).isoformat(),
@@ -879,6 +892,7 @@ def mark_chart_featured(chart: dict[str, Any] | None) -> None:
     state = load_chart_state()
     state[chart["id"]] = {
         "featured_mtime": chart["updated_mtime"],
+        "featured_signature": chart.get("signature", ""),
         "featured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     CHART_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -1320,7 +1334,7 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
     if total_items > 10:
         top = top[:10 - (1 if leader_post else 0)]
 
-    chart_of_day = select_chart_of_the_day(config)
+    chart_of_day = select_chart_of_the_day(config, errors)
     if not chart_of_day:
         chart_of_day = select_fallback_chart(now, errors)
     body = render(config, now, weather_rows, top, leader_post, leader_notes,
