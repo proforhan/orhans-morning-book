@@ -128,6 +128,8 @@ class Story:
     image_alt: str = ""
     kind: str = "news"   # news | leader | research
     via: str = ""        # e.g. "X via Nitter", "Substack", "press coverage"
+    headline: str = ""   # short rewrite of a long title; never a truncation
+    profile_url: str = ""  # thought leader X profile
 
 
 def load_config() -> dict[str, Any]:
@@ -381,6 +383,9 @@ def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
         if leader_posts:
             for post in leader_posts:
                 post.kind = "leader"
+                post.profile_url = leader.get("url") or f"https://x.com/{username}"
+                if post.via != "own publication":
+                    post.link = post.profile_url
                 post.source = f"{name} ({handle})"
                 post.summary = post.title
                 post.score = rank(post, now) + (4 if post.image_url else 0) + (
@@ -487,7 +492,7 @@ def claude_curate(
         "investment-promotion content, and duplicate coverage of the same underlying story.\n\n"
         f"From news_candidates choose exactly {top_n} items (fewer only if the pool is smaller), "
         "ordered most consequential first, covering a diverse mix of the priority topics. For each "
-        "write 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
+        "write 'headline' (only when the original title is longer than 70 characters: a complete, natural rewrite of it in 70 characters or fewer, never a truncation; otherwise an empty string), 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
         "no hype, no invented facts) and 'why' (one short sentence on why it matters to this "
         "reader).\n\n"
         "From thought_leader_posts choose the single most notable post (or null if empty) and "
@@ -496,7 +501,7 @@ def claude_curate(
         "paper, study, or peer-reviewed finding - not general news; null if none qualify) and "
         "write 'summary' (a one-sentence statement of the finding) and 'why' (one sentence).\n\n"
         "Return ONLY valid JSON, no markdown fences, in this exact shape:\n"
-        '{"top": [{"id": 0, "summary": "...", "why": "..."}], '
+        '{"top": [{"id": 0, "headline": "...", "summary": "...", "why": "..."}], '
         '"thought": {"id": 0, "summary": "..."} | null, '
         '"research": {"id": 0, "summary": "...", "why": "..."} | null}\n\n'
         + json.dumps(payload, separators=(",", ":"))
@@ -509,6 +514,7 @@ def claude_curate(
             story = news_candidates[int(item["id"])]
             story.summary = clean_text(item.get("summary")) or story.description[:360]
             story.why = clean_text(item.get("why")) or "A potentially consequential development."
+            story.headline = clean_text(item.get("headline"))
             top.append(story)
         if not top:
             raise ValueError("Claude returned no top stories")
@@ -892,7 +898,7 @@ def story_html(story: Story, number: int | None = None, show_image: bool = False
             f'<br><small>Source visual: {esc(story.source)}</small></p>'
         )
     return f"""
-      <h3>{label}<a href="{esc(story.link)}">{esc(shorten_title(story.title))}</a></h3>
+      <h3>{label}<a href="{esc(story.link)}">{esc(story.headline or story.title)}</a></h3>
       {visual}
       <p>{esc(story.summary or story.description or story.title)}</p>
       <blockquote><strong>Why it matters:</strong> {esc(story.why or "Selected for impact and relevance.")}</blockquote>
@@ -918,10 +924,9 @@ def leader_html(post: Story, number: int, timezone: str) -> str:
       </td></tr>
       </table>
       <h3>{number}. <a href="{esc(post.link)}">{esc(post.source)}</a></h3>
-      <blockquote>{esc(shorten_title(post.summary or post.title, 140))}</blockquote>
+      <blockquote>{esc(post.summary or post.title)}</blockquote>
       {visual}
-      <p><small>{esc(time_label)}{" · " if time_label else ""}<a href="{esc(post.link)}">View original →</a>
-      · <a href="{esc(post.link if post.via == "X" else "https://x.com/" + post.source.split("(@")[-1].rstrip(")"))}">Profile on X</a></small></p>
+      <p><small>{esc(time_label)}{" · " if time_label else ""}{('<a href="' + esc(post.link) + '">Read the newsletter →</a> · ') if post.via == "own publication" else ""}<a href="{esc(post.profile_url or post.link)}">Profile on X</a></small></p>
       <hr>"""
 
 
@@ -1006,14 +1011,14 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         fallback_note = (
             '''<table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="6" bgcolor="#EDE6D6">
           <tr><td>
-            <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; NO TRACKED CHART UPDATED TODAY · SPOTTED IN COVERAGE</strong></font>
+            <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; SPOTTED IN COVERAGE</strong></font>
           </td></tr>
           </table>'''
             if is_fallback else ""
         )
         chart_html = f'''
           {fallback_note}
-          <h3>{esc(shorten_title(chart_of_day["title"]))}</h3>
+          <h3>{esc(chart_of_day["title"])}</h3>
           <p align="center"><img src="{image_src}" width="600" style="max-width:100%;height:auto"
              alt="{esc(chart_of_day["title"])}"></p>
           <p>{esc(chart_of_day.get("explanation") or chart_of_day["caption"])}</p>
