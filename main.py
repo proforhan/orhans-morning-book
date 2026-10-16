@@ -1,4 +1,4 @@
-"""Orhan's Morning Brief.
+"""Orhan's Morning Intelligence.
 
 Daily, mobile-friendly morning newsletter covering AI, economics and finance,
 technology, science, academic research, medicine, and limited major
@@ -128,8 +128,6 @@ class Story:
     image_alt: str = ""
     kind: str = "news"   # news | leader | research
     via: str = ""        # e.g. "X via Nitter", "Substack", "press coverage"
-    headline: str = ""   # short rewrite of a long title; never a truncation
-    profile_url: str = ""  # thought leader X profile
 
 
 def load_config() -> dict[str, Any]:
@@ -383,9 +381,6 @@ def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
         if leader_posts:
             for post in leader_posts:
                 post.kind = "leader"
-                post.profile_url = leader.get("url") or f"https://x.com/{username}"
-                if post.via != "own publication":
-                    post.link = post.profile_url
                 post.source = f"{name} ({handle})"
                 post.summary = post.title
                 post.score = rank(post, now) + (4 if post.image_url else 0) + (
@@ -484,7 +479,7 @@ def claude_curate(
         "research_candidates": pack(research_candidates, 10),
     }
     prompt = (
-        f"You are the editor of '{config['newsletter_name']}', a concise daily briefing for a "
+        "You are the editor of 'Orhan's Morning Intelligence', a concise daily briefing for a "
         "university professor interested in AI, economics, finance, technology, science, academic "
         "research, medicine, and the football World Cup. Rank by Impact x Novelty x Relevance, "
         "weighting relevance heavily toward AI, economics, finance, academic research, and "
@@ -492,7 +487,7 @@ def claude_curate(
         "investment-promotion content, and duplicate coverage of the same underlying story.\n\n"
         f"From news_candidates choose exactly {top_n} items (fewer only if the pool is smaller), "
         "ordered most consequential first, covering a diverse mix of the priority topics. For each "
-        "write 'headline' (only when the original title is longer than 70 characters: a complete, natural rewrite of it in 70 characters or fewer, never a truncation; otherwise an empty string), 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
+        "write 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
         "no hype, no invented facts) and 'why' (one short sentence on why it matters to this "
         "reader).\n\n"
         "From thought_leader_posts choose the single most notable post (or null if empty) and "
@@ -501,7 +496,7 @@ def claude_curate(
         "paper, study, or peer-reviewed finding - not general news; null if none qualify) and "
         "write 'summary' (a one-sentence statement of the finding) and 'why' (one sentence).\n\n"
         "Return ONLY valid JSON, no markdown fences, in this exact shape:\n"
-        '{"top": [{"id": 0, "headline": "...", "summary": "...", "why": "..."}], '
+        '{"top": [{"id": 0, "summary": "...", "why": "..."}], '
         '"thought": {"id": 0, "summary": "..."} | null, '
         '"research": {"id": 0, "summary": "...", "why": "..."} | null}\n\n'
         + json.dumps(payload, separators=(",", ":"))
@@ -514,7 +509,6 @@ def claude_curate(
             story = news_candidates[int(item["id"])]
             story.summary = clean_text(item.get("summary")) or story.description[:360]
             story.why = clean_text(item.get("why")) or "A potentially consequential development."
-            story.headline = clean_text(item.get("headline"))
             top.append(story)
         if not top:
             raise ValueError("Claude returned no top stories")
@@ -576,6 +570,20 @@ def esc(value: Any) -> str:
 # ---------------------------------------------------------------------------
 # Charts (FRED + configured local charts)
 # ---------------------------------------------------------------------------
+
+def log(message: str) -> None:
+    """Diagnostics for the CI log (stderr). Never shown in the email itself."""
+    print(f"[omi] {message}", file=sys.stderr)
+
+
+def file_signature(path: Path) -> str:
+    """Hash of a local file's bytes: 'new' means 'different content'."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
 
 def load_chart_state() -> dict[str, Any]:
     if not CHART_STATE.exists():
@@ -706,7 +714,6 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
                      unit: str = "%", zero_baseline: bool = False,
                      explanation_template: str = "") -> dict[str, Any] | None:
     chart_path = OUTPUT / f"{chart_id}.png"
-    metadata_path = OUTPUT / f"{chart_id}.json"
     observations = fred_observations(series_id, start)
     if len(observations) < max(5, yoy_lag + 1):
         return None
@@ -721,25 +728,15 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
     previous_value = series[-2][1]
     cutoff = latest_date.replace(year=latest_date.year - years_plotted)
     plotted = [(date, value) for date, value in series if date >= cutoff]
-    metadata = {
-        "latest_date": latest_date.isoformat(),
-        "latest_value": round(latest_value, 2),
-        "previous_value": round(previous_value, 2),
-        "data_signature": hashlib.sha256(json.dumps(
-            [(date.isoformat(), round(value, 3)) for date, value in series],
-            separators=(",", ":"),
-        ).encode("utf-8")).hexdigest(),
-    }
-    old_metadata = {}
-    if metadata_path.exists():
-        try:
-            old_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pass
-    if old_metadata.get("data_signature") != metadata["data_signature"] or not chart_path.exists():
-        draw_line_chart(chart_path, plotted, title, subtitle, f"Source: {source}", unit,
-                        zero_baseline=zero_baseline)
-        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    # The signature is a hash of the data itself. It alone decides whether
+    # this chart counts as "new" (see select_chart_of_the_day) - never file
+    # timestamps, which are reset on every ephemeral CI run.
+    signature = hashlib.sha256(json.dumps(
+        [(date.isoformat(), round(value, 3)) for date, value in series],
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    draw_line_chart(chart_path, plotted, title, subtitle, f"Source: {source}", unit,
+                    zero_baseline=zero_baseline)
 
     direction = "rose" if latest_value > previous_value else "eased" if latest_value < previous_value else "held steady"
     period = (
@@ -755,17 +752,18 @@ def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
         "id": chart_id,
         "title": title,
         "image_path": str(chart_path),
-        "trigger_path": str(metadata_path),
+        "signature": signature,
+        "data_date": latest_date.isoformat(),
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "caption": caption,
         "explanation": explanation,
         "source": source,
         "source_url": source_url,
         "priority": priority,
-        "signature": metadata["data_signature"],
     }
 
 
-def fred_chart_sources(errors: list[str] | None = None) -> list[dict[str, Any]]:
+def fred_chart_sources(errors: list[str]) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     builders = [
         dict(series_id="GDP", chart_id="fred_gdp_growth",
@@ -807,52 +805,96 @@ def fred_chart_sources(errors: list[str] | None = None) -> list[dict[str, Any]]:
             built = build_fred_chart(**kwargs)
             if built:
                 sources.append(built)
+            else:
+                errors.insert(0, f"FRED {kwargs['chart_id']}: too few observations")
         except Exception as exc:
-            if errors is not None:
-                errors.append(f"FRED {kwargs['chart_id']}: {type(exc).__name__}")
-            continue
+            # Inserted at the front so the email's 6-item "Source notes"
+            # footer can't truncate a chart failure behind feed noise.
+            errors.insert(0, f"FRED {kwargs['chart_id']}: {type(exc).__name__}")
     return sources
+
+
+# If no tracked chart has been featured for longer than this, the Chart of the
+# Day pipeline is presumed broken and the email says so (see below). The
+# daily Treasury chart changes every business day, so a healthy pipeline never
+# goes this long without featuring something.
+STALE_CHART_DAYS = 3
+
+
+def local_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Configured chart images present on this machine, identified by content."""
+    sources: list[dict[str, Any]] = []
+    for source in config.get("chart_sources", []):
+        image_path = Path(source["image_path"])
+        if not image_path.is_file():
+            # Expected on CI for charts that live on a personal computer.
+            log(f"chart '{source['id']}': image not found at {image_path}; skipped")
+            continue
+        sources.append({
+            **source,
+            "priority": source.get("priority", 100),
+            "signature": file_signature(image_path),
+            # mtime is a display label only; it never decides anything.
+            "updated_at": dt.datetime.fromtimestamp(
+                image_path.stat().st_mtime, dt.timezone.utc).isoformat(),
+        })
+    return sources
+
+
+def last_featured_at(state: dict[str, Any]) -> dt.datetime | None:
+    stamps: list[dt.datetime] = []
+    for entry in state.values():
+        try:
+            stamps.append(dt.datetime.fromisoformat(entry["featured_at"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return max(stamps) if stamps else None
 
 
 def select_chart_of_the_day(config: dict[str, Any],
                             errors: list[str] | None = None) -> dict[str, Any] | None:
+    """Pick today's tracked chart, or None when nothing tracked is new.
+
+    A chart is "new" when its content signature differs from the signature
+    recorded when it was last featured. The signature is a hash of the chart's
+    own data (FRED series) or bytes (local images), so the decision depends on
+    nothing but that content: not file timestamps, not what files happen to be
+    left in the working directory, not which machine or CI runner built it.
+    Every source type goes through this one path, so a new data release is
+    picked up automatically with no code or config change.
+    """
+    errors = errors if errors is not None else []
     state = load_chart_state()
-    candidates: list[dict[str, Any]] = []
-    sources = [{**source, "priority": source.get("priority", 100)}
-               for source in config.get("chart_sources", [])]
+    sources = local_chart_sources(config)
     sources.extend(fred_chart_sources(errors))
+
+    candidates: list[dict[str, Any]] = []
     for source in sources:
-        image_path = Path(source["image_path"])
-        trigger_path = Path(source.get("trigger_path", source["image_path"]))
-        if not image_path.is_file() or not trigger_path.exists():
+        featured = state.get(source["id"], {}).get("featured_signature")
+        if source["signature"] == featured:
+            log(f"chart '{source['id']}': already featured, data unchanged; skipped")
             continue
-        image_mtime = image_path.stat().st_mtime
-        trigger_mtime = trigger_path.stat().st_mtime
-        signature = source.get("signature")
-        if signature:
-            # Charts rebuilt fresh on every run (FRED): file mtimes are always
-            # "now" on an ephemeral runner, so key "already featured" on the
-            # data itself, not on timestamps.
-            if state.get(source["id"], {}).get("featured_signature") == signature:
-                continue
-            updated_at = image_mtime
-        else:
-            if trigger_path != image_path and image_mtime < trigger_mtime:
-                continue
-            updated_at = max(image_mtime, trigger_mtime)
-            last_featured = float(state.get(source["id"], {}).get("featured_mtime", 0))
-            if updated_at <= last_featured:
-                continue
-        candidates.append({
-            **source,
-            "updated_at": dt.datetime.fromtimestamp(updated_at, dt.timezone.utc).isoformat(),
-            "updated_mtime": updated_at,
-            "image_mtime": image_mtime,
-        })
-    return max(
-        candidates,
-        key=lambda item: (item.get("priority", 0), item["updated_mtime"]),
-    ) if candidates else None
+        log(f"chart '{source['id']}': new data; eligible")
+        candidates.append(source)
+
+    if candidates:
+        # Highest priority first; ties go to the most recent underlying data.
+        chosen = max(candidates, key=lambda item: (
+            item.get("priority", 0), item.get("data_date") or item["updated_at"][:10]))
+        log(f"chart of the day: '{chosen['id']}'")
+        return chosen
+
+    # Nothing new. Fine for a day or two; a long gap means something is broken,
+    # and that must be visible in the email rather than silent.
+    if not sources:
+        errors.insert(0, "Chart of the Day: no tracked chart source could be loaded.")
+    else:
+        last = last_featured_at(state)
+        now = dt.datetime.now(dt.timezone.utc)
+        if last is not None and now - last > dt.timedelta(days=STALE_CHART_DAYS):
+            errors.insert(0, "Chart of the Day: no tracked chart has been featured since "
+                             f"{last.date().isoformat()}; check the chart sources.")
+    return None
 
 
 def select_fallback_chart(now: dt.datetime, errors: list[str]) -> dict[str, Any] | None:
@@ -887,14 +929,15 @@ def select_fallback_chart(now: dt.datetime, errors: list[str]) -> dict[str, Any]
 
 
 def mark_chart_featured(chart: dict[str, Any] | None) -> None:
-    if not chart or chart.get("is_fallback") or "updated_mtime" not in chart:
+    if not chart or chart.get("is_fallback") or "signature" not in chart:
         return
     state = load_chart_state()
     state[chart["id"]] = {
-        "featured_mtime": chart["updated_mtime"],
-        "featured_signature": chart.get("signature", ""),
+        "featured_signature": chart["signature"],
+        "featured_data_date": chart.get("data_date", ""),
         "featured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    CHART_STATE.parent.mkdir(exist_ok=True)
     CHART_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
@@ -912,7 +955,7 @@ def story_html(story: Story, number: int | None = None, show_image: bool = False
             f'<br><small>Source visual: {esc(story.source)}</small></p>'
         )
     return f"""
-      <h3>{label}<a href="{esc(story.link)}">{esc(story.headline or story.title)}</a></h3>
+      <h3>{label}<a href="{esc(story.link)}">{esc(shorten_title(story.title))}</a></h3>
       {visual}
       <p>{esc(story.summary or story.description or story.title)}</p>
       <blockquote><strong>Why it matters:</strong> {esc(story.why or "Selected for impact and relevance.")}</blockquote>
@@ -938,9 +981,10 @@ def leader_html(post: Story, number: int, timezone: str) -> str:
       </td></tr>
       </table>
       <h3>{number}. <a href="{esc(post.link)}">{esc(post.source)}</a></h3>
-      <blockquote>{esc(post.summary or post.title)}</blockquote>
+      <blockquote>{esc(shorten_title(post.summary or post.title, 140))}</blockquote>
       {visual}
-      <p><small>{esc(time_label)}{" · " if time_label else ""}{('<a href="' + esc(post.link) + '">Read the newsletter →</a> · ') if post.via == "own publication" else ""}<a href="{esc(post.profile_url or post.link)}">Profile on X</a></small></p>
+      <p><small>{esc(time_label)}{" · " if time_label else ""}<a href="{esc(post.link)}">View original →</a>
+      · <a href="{esc(post.link if post.via == "X" else "https://x.com/" + post.source.split("(@")[-1].rstrip(")"))}">Profile on X</a></small></p>
       <hr>"""
 
 
@@ -1025,14 +1069,14 @@ def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str
         fallback_note = (
             '''<table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="6" bgcolor="#EDE6D6">
           <tr><td>
-            <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; SPOTTED IN COVERAGE</strong></font>
+            <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; NO TRACKED CHART UPDATED TODAY · SPOTTED IN COVERAGE</strong></font>
           </td></tr>
           </table>'''
             if is_fallback else ""
         )
         chart_html = f'''
           {fallback_note}
-          <h3>{esc(chart_of_day["title"])}</h3>
+          <h3>{esc(shorten_title(chart_of_day["title"]))}</h3>
           <p align="center"><img src="{image_src}" width="600" style="max-width:100%;height:auto"
              alt="{esc(chart_of_day["title"])}"></p>
           <p>{esc(chart_of_day.get("explanation") or chart_of_day["caption"])}</p>
@@ -1258,10 +1302,10 @@ def send_email(config: dict[str, Any], subject: str, body: str) -> None:
     if not user or not password:
         raise RuntimeError("Set GMAIL_USER and GMAIL_APP_PASSWORD to enable SMTP delivery.")
     msg = EmailMessage()
-    msg["From"] = f"{config['newsletter_name']} <{user}>"
+    msg["From"] = f"Orhan's Morning Intelligence <{user}>"
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
-    msg.set_content(f"{config['newsletter_name']} is best viewed as HTML.")
+    msg.set_content("Orhan's Morning Intelligence is best viewed as HTML.")
     msg.add_alternative(body, subtype="html")
     chart = select_chart_of_the_day(config)
     if chart and "cid:chart-of-the-day" in body:
@@ -1364,41 +1408,11 @@ def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
         if os.name == "nt"
         else now.strftime("%B %-d, %Y")
     )
-    return dated, make_subject(config, top, date_label), manifest
-
-
-# Trailing source tags that feeds append to headlines, e.g. " - Reuters", " | Financial Times".
-# Only a short run of capitalized words after " - " or " | " counts, so a real
-# clause after an em dash ("... jump 8% — the strongest since 2024") is kept.
-_SOURCE_SUFFIX = re.compile(
-    r"\s+[-|]\s+(?:[A-Z][\w&.'\u2019]*(?:\s+(?:of|the|[A-Z][\w&.'\u2019]*)){0,3}"
-    r"|[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|news|co|io|in|uk))$"
-)
-_BYLINE_SUFFIX = re.compile(r"\s+By\s+[A-Z][\w&.]*(?:\s+[A-Z][\w&.]*)?$")
-
-
-def make_subject(config: dict[str, Any], top: list[Story], date_label: str) -> str:
-    """Subject line = the day's lead story, so the inbox shows what is new.
-
-    Buttondown already prints the newsletter name and date under the title,
-    and the email's masthead shows the name again, so repeating the name in
-    the subject made it appear three times. Falls back to "Name | Date" when
-    there is no lead story.
-    """
-    fallback = f"{config['newsletter_name']} | {date_label}"
-    if not top or not (top[0].title or "").strip():
-        return fallback
-    headline = " ".join(re.sub(r"[\u200b-\u200d\ufeff]", "", top[0].title).split())
-    trimmed = _BYLINE_SUFFIX.sub("", _SOURCE_SUFFIX.sub("", headline)).strip()
-    if len(trimmed) >= 20:
-        headline = trimmed
-    if len(headline) > 110:
-        headline = headline[:107].rsplit(" ", 1)[0].rstrip(",;:-") + "…"
-    return headline
+    return dated, f"{config['newsletter_name']} | {date_label}", manifest
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Brief.")
+    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Intelligence.")
     parser.add_argument("--no-send", action="store_true", help="Generate files without sending email.")
     parser.add_argument("--no-ai", action="store_true", help="Use feed descriptions instead of Claude summaries.")
     args = parser.parse_args()
