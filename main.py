@@ -13,12 +13,14 @@ plus a red workflow run; the newsletter itself still goes out.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import os
 import sys
 import traceback
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -104,6 +106,22 @@ def build_chart(health: Health, now: dt.datetime):
     return chart
 
 
+def inline_chart(body: str, chart: dict[str, Any] | None) -> str:
+    """For the saved preview only: embed the chart PNG so latest.html shows it.
+
+    The email itself keeps the cid: placeholder, which delivery replaces with
+    a hosted image URL; this copy is just for looking at a test run.
+    """
+    path = (chart or {}).get("image_path")
+    if not path or "cid:chart-of-the-day" not in body:
+        return body
+    try:
+        data = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    except OSError:
+        return body
+    return body.replace("cid:chart-of-the-day", f"data:image/png;base64,{data}")
+
+
 def build(no_ai: bool, health: Health):
     config = load_config()
     now = dt.datetime.now(ZoneInfo(config["timezone"]))
@@ -131,7 +149,7 @@ def build(no_ai: bool, health: Health):
     OUTPUT.mkdir(exist_ok=True)
     dated = OUTPUT / f"omb_{now:%Y-%m-%d}.html"
     dated.write_text(body, encoding="utf-8")
-    (OUTPUT / "latest.html").write_text(body, encoding="utf-8")
+    (OUTPUT / "latest.html").write_text(inline_chart(body, results["chart"]), encoding="utf-8")
     (OUTPUT / "latest.json").write_text(json.dumps({
         "generated_at": now.isoformat(),
         "chart_of_the_day": results["chart"],
@@ -152,7 +170,7 @@ def main() -> int:
     try:
         subject, body, chart = build(args.no_ai, health)
         if not args.no_send:
-            send_via_buttondown(subject, body, chart)
+            send_via_buttondown(subject, body, chart, health)
     except Exception as exc:
         health.problem("run", f"failed: {type(exc).__name__}: {exc}")
         health.write()

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .charts import mark_chart_featured
-from .common import esc
+from .health import Health
 
 BUTTONDOWN_API_ROOT = "https://api.buttondown.com/v1"
 
@@ -67,7 +67,8 @@ def buttondown_upload_image(api_key: str, image_path: Path) -> str:
 
 
 def send_via_buttondown(subject: str, body: str,
-                        chart_of_day: dict[str, Any] | None = None) -> None:
+                        chart_of_day: dict[str, Any] | None = None,
+                        health: Health | None = None) -> None:
     """Deliver the newsletter through Buttondown.
 
     Buttondown owns the subscriber list (and unsubscribe handling) for
@@ -92,15 +93,20 @@ def send_via_buttondown(subject: str, body: str,
         return
 
     chart = chart_of_day
+    upload_failed = False
     if chart and "cid:chart-of-the-day" in body:
         try:
             hosted_url = buttondown_upload_image(api_key, Path(chart["image_path"]))
             body = body.replace("cid:chart-of-the-day", hosted_url)
         except Exception as exc:
-            # Don't let a chart upload failure block the rest of the newsletter.
+            # Don't let a chart upload failure block the rest of the newsletter,
+            # but do make it visible: it raises a health alert.
+            upload_failed = True
+            if health is not None:
+                health.problem("chart", f"chart image upload failed: {type(exc).__name__}")
             body = body.replace(
                 'src="cid:chart-of-the-day"',
-                f'src="" alt="Chart of the Day unavailable ({esc(exc)})"',
+                'src="" alt="Chart of the Day is unavailable today"',
             )
 
     created = buttondown_request(
@@ -114,7 +120,10 @@ def send_via_buttondown(subject: str, body: str,
             "PATCH", f"{BUTTONDOWN_API_ROOT}/emails/{email_id}", api_key,
             json_body={"status": "about_to_send"},
         )
-        if os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}:
+        # A chart whose picture never reached subscribers is not "featured":
+        # leaving it unrecorded lets tomorrow's run try it again.
+        if (not upload_failed
+                and os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}):
             mark_chart_featured(chart)
         print(f"Buttondown email {email_id} queued to send to subscribers.")
     else:

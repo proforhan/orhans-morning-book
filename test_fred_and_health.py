@@ -136,5 +136,56 @@ class HealthTests(unittest.TestCase):
             self.assertFalse(health.send_alert("s", "b"))
 
 
+class ChartUploadTests(unittest.TestCase):
+    """A chart image that fails to upload must alert and must not be marked featured."""
+
+    def _send(self, upload_side_effect, live="true"):
+        from omi import deliver
+        h = health.Health()
+        chart = {"id": "fred_cpi_inflation", "image_path": "x.png", "signature": "s"}
+        body = '<img src="cid:chart-of-the-day">'
+        sent = {}
+
+        def fake_request(method, url, key, **kw):
+            sent[method] = kw.get("json_body")
+            return {"id": "e1"}
+
+        env = {"BUTTONDOWN_API_KEY": "k", "OMI_BUTTONDOWN_LIVE": live}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(deliver, "buttondown_upload_image", side_effect=upload_side_effect), \
+                mock.patch.object(deliver, "buttondown_request", fake_request), \
+                mock.patch.object(deliver, "mark_chart_featured") as marked:
+            deliver.send_via_buttondown("subj", body, chart, h)
+        return h, sent, marked
+
+    def test_upload_failure_alerts_and_skips_featured_mark(self) -> None:
+        h, sent, marked = self._send(RuntimeError("boom"))
+        self.assertFalse(h.ok)
+        self.assertIn("chart image upload failed", h.summary())
+        marked.assert_not_called()
+        self.assertNotIn("cid:", sent["POST"]["body"])
+
+    def test_upload_success_is_clean_and_marks_featured(self) -> None:
+        h, sent, marked = self._send(lambda *a, **k: "https://img.test/c.png")
+        self.assertTrue(h.ok)
+        marked.assert_called_once()
+        self.assertIn("https://img.test/c.png", sent["POST"]["body"])
+
+
+class PreviewTests(unittest.TestCase):
+    def test_inline_chart_embeds_png_for_preview_only(self) -> None:
+        import main
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "c.png"
+            png.write_bytes(b"\x89PNG-fake")
+            out = main.inline_chart('<img src="cid:chart-of-the-day">', {"image_path": str(png)})
+        self.assertIn("data:image/png;base64,", out)
+        self.assertNotIn("cid:", out)
+
+    def test_inline_chart_without_chart_leaves_body_alone(self) -> None:
+        import main
+        self.assertEqual(main.inline_chart("<p>x</p>", None), "<p>x</p>")
+
+
 if __name__ == "__main__":
     unittest.main()
