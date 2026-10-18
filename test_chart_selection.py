@@ -1,12 +1,12 @@
 """Regression tests for Chart of the Day selection.
 
 The invariant being protected: whether a chart is "new" depends only on its
-content (a hash of the data or image bytes) compared with what was recorded
+content (a hash of the data) compared with what was recorded
 when it was last featured. It must not depend on file timestamps or on what
 happens to be left in the working directory, because the newsletter runs on
 ephemeral CI runners where both are reset every day.
 
-Run from the repo root:  python -m unittest test_chart_selection -v
+Run from the repo root:  python -m unittest discover -v
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import main
+from omi import charts as main
 
 
 def month_range(first: tuple[int, int], last: tuple[int, int]) -> list[dt.date]:
@@ -69,11 +69,10 @@ class ChartSelectionTests(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        self.config: dict = {"chart_sources": []}
 
     def select(self) -> tuple[dict | None, list[str]]:
         errors: list[str] = []
-        return main.select_chart_of_the_day(self.config, errors), errors
+        return main.select_chart_of_the_day(errors), errors
 
     def feature_everything_available(self) -> None:
         """Simulate days of live sends until nothing eligible remains."""
@@ -170,33 +169,6 @@ class ChartSelectionTests(unittest.TestCase):
         chart, errors = self.select()
         self.assertIsNone(chart)
         self.assertEqual(errors, [])
-
-    def test_local_image_is_keyed_on_content_not_mtime(self) -> None:
-        image = Path(self.tmp.name) / "tracker.png"
-        image.write_bytes(b"version-1")
-        self.config = {"chart_sources": [{
-            "id": "tracker", "title": "Tracker", "image_path": str(image),
-            "caption": "c", "explanation": "e", "source": "s", "priority": 100,
-        }]}
-        chart, _ = self.select()
-        self.assertEqual(chart["id"], "tracker")
-        main.mark_chart_featured(chart)
-
-        os.utime(image, (4102444800, 4102444800))  # touched, same bytes
-        self.assertNotEqual(self.select()[0]["id"], "tracker")
-
-        image.write_bytes(b"version-2")             # genuinely re-exported
-        os.utime(image, (0, 0))                     # even with an old timestamp
-        self.assertEqual(self.select()[0]["id"], "tracker")
-
-    def test_missing_local_image_is_skipped_quietly(self) -> None:
-        self.config = {"chart_sources": [{
-            "id": "gone", "title": "Gone", "image_path": r"C:\Users\nobody\gone.png",
-            "caption": "c", "explanation": "e", "source": "s", "priority": 100,
-        }]}
-        chart, errors = self.select()
-        self.assertEqual(chart["id"], "fred_cpi_inflation")
-        self.assertEqual(errors, [])  # logged to stderr only, not the email footer
 
 
 if __name__ == "__main__":

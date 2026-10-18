@@ -1,1438 +1,176 @@
-"""Orhan's Morning Intelligence.
+"""Orhan's Morning Brief: build the daily newsletter and deliver it.
 
-Daily, mobile-friendly morning newsletter covering AI, economics and finance,
-technology, science, academic research, medicine, and limited major
-geopolitical developments, with a Weather Snapshot, Top News (including one
-thought-leader item), Research Radar, and Chart of the Day.
+Each section (weather, news, research, chart) is built by its own module
+inside a guard, so one failing source degrades that section only. Whatever
+goes wrong is recorded by omi.health and reported as a "needs attention" email
+plus a red workflow run; the newsletter itself still goes out.
 
-Curation and summaries are produced by the Claude API when a key is
-available; the generator degrades gracefully to cleaned feed text otherwise.
+    python main.py             build and send (what the workflow runs)
+    python main.py --no-send   build output/latest.html only
+    python main.py --no-ai     skip Claude, use raw feed text
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
-import email.utils
-import hashlib
-import html
 import json
-import math
 import os
-import re
-import smtplib
-import ssl
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
-import xml.etree.ElementTree as ET
-from dataclasses import dataclass, asdict
-from email.message import EmailMessage
-from pathlib import Path
+import traceback
+from dataclasses import asdict
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageDraw, ImageFont
+from omi.charts import select_chart_of_the_day, select_fallback_chart
+from omi.common import OUTPUT, load_config, log
+from omi.curate import claude_curate
+from omi.deliver import send_via_buttondown
+from omi.health import Health, send_alert
+from omi.leaders import collect_thought_leaders
+from omi.news import (ECONOMIST_FEEDS, NEWS_FEEDS, RESEARCH_FEEDS, collect, deduplicate,
+                      rank, recent, select_diverse)
+from omi.render import render
+from omi.weather import weather
+
+# Fewer top stories than this means the news section is effectively broken.
+MIN_TOP_STORIES = 4
 
 
-ROOT = Path(__file__).resolve().parent
-OUTPUT = ROOT / "output"
-CHART_STATE = OUTPUT / "chart_of_the_day_state.json"
-USER_AGENT = "OrhanMorningIntelligence/2.0 (+personal research newsletter)"
-
-TOPIC_WEIGHTS = {
-    "artificial intelligence": 10, " ai ": 9, "machine learning": 9,
-    "large language model": 9, "openai": 8, "anthropic": 8, "nvidia": 7,
-    "economy": 7, "economic": 7, "inflation": 7, "federal reserve": 7,
-    "interest rate": 7, "market": 5, "trade": 5, "technology": 6,
-    "microsoft": 5, "google": 5, "apple": 5, "meta": 5, "amazon": 5,
-    "science": 6, "research": 7, "study": 6, "arxiv": 7,
-    "medicine": 7, "health": 6, "clinical": 7, "cancer": 7, "drug": 6,
-    "world cup": 6, "football": 4, "soccer": 5,
-}
-
-SOURCE_BONUS = {
-    "Reuters": 12, "Associated Press": 11, "BBC": 8, "NPR": 8,
-    "Nature": 12, "Science": 12, "NEJM": 12, "JAMA": 11, "arXiv": 8,
-    "SSRN": 9, "Financial Times": 12, "The Economist": 10,
-    "The New York Times": 8, "The Washington Post": 8, "The Guardian": 6,
-    "MIT Technology Review": 10, "STAT": 10, "Scientific American": 8,
-    "Federal Reserve": 12, "World Health Organization": 12,
-}
-
-NEGATIVE_TERMS = {
-    "stocks poised": 18, "stock to buy": 18, "prediction:": 12,
-    "could make you": 15, "millionaire": 15, "motley fool": 16,
-    "aol.com": 10, "sponsored": 20, "opinion:": 5, "celebrity": 20,
-    "moneyshow.com": 16, "digital journal": 7,
-    "american council on science and health": 7,
-}
-
-NEWS_FEEDS = [
-    ("Reuters", "https://news.google.com/rss/search?q=source:Reuters+when:1d&hl=en-US&gl=US&ceid=US:en"),
-    ("BBC", "https://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("NPR", "https://feeds.npr.org/1001/rss.xml"),
-    ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
-    ("Google News: AI", "https://news.google.com/rss/search?q=artificial+intelligence+when:1d&hl=en-US&gl=US&ceid=US:en"),
-    ("Google News: Economics & Finance", "https://news.google.com/rss/search?q=economics+finance+financial+markets+when:1d&hl=en-US&gl=US&ceid=US:en"),
-    ("Google News: Science", "https://news.google.com/rss/search?q=science+research+when:1d&hl=en-US&gl=US&ceid=US:en"),
-    ("Google News: Medicine", "https://news.google.com/rss/search?q=medicine+healthcare+when:1d&hl=en-US&gl=US&ceid=US:en"),
-    ("Google News: World Cup", "https://news.google.com/rss/search?q=FIFA+World+Cup+when:1d&hl=en-US&gl=US&ceid=US:en"),
-]
-
-ECONOMIST_FEEDS = [
-    ("The Economist", "https://www.economist.com/the-world-this-week/rss.xml"),
-    ("The Economist", "https://www.economist.com/business/rss.xml"),
-    ("The Economist", "https://www.economist.com/science-and-technology/rss.xml"),
-]
-
-RESEARCH_FEEDS = [
-    ("Nature", "https://news.google.com/rss/search?q=site:nature.com+research+when:3d&hl=en-US&gl=US&ceid=US:en"),
-    ("Science", "https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=science"),
-    ("NEJM", "https://www.nejm.org/action/showFeed?type=etoc&feed=rss&jc=nejm"),
-    ("JAMA", "https://jamanetwork.com/rss/site_3/67.xml"),
-    ("arXiv", "https://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.LG+OR+cat:econ.EM+OR+cat:q-bio&sortBy=submittedDate&sortOrder=descending&max_results=20"),
-    ("SSRN", "https://news.google.com/rss/search?q=site:ssrn.com+OR+%22SSRN%22+paper+when:7d&hl=en-US&gl=US&ceid=US:en"),
-    ("AI Conferences", "https://news.google.com/rss/search?q=NeurIPS+OR+ICML+OR+ICLR+OR+%22AI+conference%22+paper+when:3d&hl=en-US&gl=US&ceid=US:en"),
-]
-
-# Used only when none of the tracked local/FRED charts have anything newly
-# updated to feature (see select_fallback_chart). These are outlets whose
-# posts are built around a chart or graphic, so a story pulled from here is
-# likely to actually be chart-led rather than just illustrated with one.
-FALLBACK_CHART_FEEDS = [
-    ("The Economist: Graphic Detail", "https://www.economist.com/graphic-detail/rss.xml"),
-    ("Visual Capitalist", "https://www.visualcapitalist.com/feed/"),
-    ("Our World in Data", "https://ourworldindata.org/atom.xml"),
-    ("Reuters Graphics", "https://news.google.com/rss/search?q=site:reuters.com+(graphic+OR+%22in+charts%22)+when:4d&hl=en-US&gl=US&ceid=US:en"),
-    ("Axios Visuals", "https://news.google.com/rss/search?q=site:axios.com+chart+when:4d&hl=en-US&gl=US&ceid=US:en"),
-]
-
-CHART_KEYWORDS = ("chart", "charts", "graphic", "data show", "in numbers", "visualized", "infographic")
-
-
-@dataclass
-class Story:
-    title: str
-    link: str
-    source: str
-    published: dt.datetime | None
-    description: str = ""
-    summary: str = ""
-    why: str = ""
-    score: float = 0.0
-    image_url: str = ""
-    image_alt: str = ""
-    kind: str = "news"   # news | leader | research
-    via: str = ""        # e.g. "X via Nitter", "Substack", "press coverage"
-
-
-def load_config() -> dict[str, Any]:
-    return json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-
-
-def fetch(url: str, timeout: int = 20) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return response.read()
-
-
-def clean_text(value: str | None) -> str:
-    text = html.unescape(value or "")
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def shorten_title(title: str, limit: int = 70) -> str:
-    """Trim an over-long headline to a word boundary, adding an ellipsis."""
-    title = title.strip()
-    if len(title) <= limit:
-        return title
-    truncated = title[:limit].rsplit(" ", 1)[0].rstrip(",.;:-\u2013\u2014 ")
-    return f"{truncated}\u2026" if truncated else f"{title[:limit].rstrip()}\u2026"
-
-
-def child_text(node: ET.Element, names: tuple[str, ...]) -> str:
-    for child in node.iter():
-        if child.tag.split("}")[-1].lower() in names and child.text:
-            return child.text.strip()
-    return ""
-
-
-def parse_date(value: str) -> dt.datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = email.utils.parsedate_to_datetime(value)
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
-    except (TypeError, ValueError):
+def build_weather(config: dict[str, Any], health: Health) -> list[dict[str, Any]]:
+    rows = []
+    errors = health.errors("weather")
+    for loc in config.get("weather_locations", []):
         try:
-            return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-
-
-def parse_feed(source: str, url: str) -> list[Story]:
-    raw = fetch(url)
-    raw = re.sub(
-        rb"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9A-Fa-f]+;)[A-Za-z][A-Za-z0-9]+;",
-        b" ",
-        raw,
-    )
-    root = ET.fromstring(raw)
-    entries = [n for n in root.iter() if n.tag.split("}")[-1].lower() in {"item", "entry"}]
-    stories: list[Story] = []
-    for entry in entries:
-        title = clean_text(child_text(entry, ("title",)))
-        link = child_text(entry, ("link",))
-        if not link:
-            link_node = next((n for n in entry.iter() if n.tag.split("}")[-1].lower() == "link"), None)
-            link = link_node.attrib.get("href", "") if link_node is not None else ""
-        elif not link.startswith("http"):
-            link_node = next((n for n in entry.iter() if n.tag.split("}")[-1].lower() == "link"), None)
-            link = link_node.attrib.get("href", link) if link_node is not None else link
-        raw_description = child_text(entry, ("description", "summary", "content"))
-        description = clean_text(raw_description)
-        published = parse_date(child_text(entry, ("pubdate", "published", "updated", "date")))
-        item_source = clean_text(child_text(entry, ("source",)))
-        resolved_source = item_source if source.startswith("Google News:") and item_source else source
-        image_url = ""
-        for node in entry.iter():
-            tag = node.tag.split("}")[-1].lower()
-            candidate = node.attrib.get("url", "")
-            media_type = node.attrib.get("type", "")
-            if tag in {"thumbnail", "content", "enclosure"} and candidate:
-                if tag == "thumbnail" or media_type.startswith("image/"):
-                    image_url = candidate
-                    break
-        if not image_url:
-            image_match = re.search(r'<img[^>]+src=["\']([^"\']+)', raw_description, re.I)
-            image_url = html.unescape(image_match.group(1)) if image_match else ""
-        if any(x in image_url.lower() for x in ("gstatic.com/favicon", "google.com/s2/favicons")):
-            image_url = ""
-        if title and link:
-            stories.append(Story(
-                title, link, resolved_source, published, description[:1200],
-                image_url=image_url, image_alt=f"Source visual for {title}",
-            ))
-    return stories
-
-
-def collect(feeds: list[tuple[str, str]], errors: list[str]) -> list[Story]:
-    stories: list[Story] = []
-    for source, url in feeds:
-        try:
-            stories.extend(parse_feed(source, url))
+            rows.append(weather(loc["city"], loc["latitude"], loc["longitude"], config["timezone"]))
         except Exception as exc:
-            errors.append(f"{source}: {type(exc).__name__}")
-    return stories
-
-
-def canonical_title(title: str) -> str:
-    title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title.lower())
-    return re.sub(r"[^a-z0-9 ]", "", title)
-
-
-def deduplicate(stories: list[Story]) -> list[Story]:
-    seen: set[str] = set()
-    result: list[Story] = []
-    for story in stories:
-        key = " ".join(canonical_title(story.title).split()[:12])
-        digest = hashlib.sha1(key.encode()).hexdigest()[:12]
-        if digest not in seen:
-            seen.add(digest)
-            result.append(story)
-    return result
-
-
-def rank(story: Story, now: dt.datetime) -> float:
-    text = f" {story.title} {story.description} ".lower()
-    relevance = sum(weight for term, weight in TOPIC_WEIGHTS.items() if term in text)
-    penalty = sum(weight for term, weight in NEGATIVE_TERMS.items() if term in text)
-    source = SOURCE_BONUS.get(story.source, 1)
-    age_bonus = 0.0
-    if story.published:
-        age = max(0, (now.astimezone(dt.timezone.utc) - story.published.astimezone(dt.timezone.utc)).total_seconds() / 3600)
-        age_bonus = max(0, 8 - age / 4)
-    title_signal = min(6, len(story.description) / 120)
-    impact = sum(
-        2 for term in ("announces", "launches", "approves", "breakthrough", "war", "ceasefire",
-                       "federal reserve", "inflation", "clinical trial", "study finds")
-        if term in text
-    )
-    return relevance * 1.8 + source + age_bonus + title_signal + impact - penalty
-
-
-def recent(stories: list[Story], now: dt.datetime, hours: int) -> list[Story]:
-    cutoff = now.astimezone(dt.timezone.utc) - dt.timedelta(hours=hours)
-    return [s for s in stories if not s.published or s.published.astimezone(dt.timezone.utc) >= cutoff]
-
-
-def category(story: Story) -> str:
-    text = f" {story.title} {story.description} ".lower()
-    if any(x in text for x in ("medicine", "health", "clinical", "cancer", "drug", "physician")):
-        return "health"
-    if any(x in text for x in ("econom", "market", "inflation", "federal reserve", "trade", "tariff")):
-        return "economics"
-    if any(x in text for x in ("world cup", "football", "soccer", "fifa")):
-        return "football"
-    if any(x in text for x in ("artificial intelligence", " ai ", "machine learning", "llm")):
-        return "ai"
-    if any(x in text for x in ("research", "science", "study", "arxiv")):
-        return "science"
-    return "world-tech"
-
-
-def select_diverse(stories: list[Story], limit: int, per_category: int = 3,
-                   per_source: int = 2) -> list[Story]:
-    selected: list[Story] = []
-    categories: dict[str, int] = {}
-    sources: dict[str, int] = {}
-    for story in sorted(stories, key=lambda x: x.score, reverse=True):
-        group = category(story)
-        if categories.get(group, 0) >= per_category or sources.get(story.source, 0) >= per_source:
-            continue
-        selected.append(story)
-        categories[group] = categories.get(group, 0) + 1
-        sources[story.source] = sources.get(story.source, 0) + 1
-        if len(selected) == limit:
-            break
-    return selected
-
-
-# ---------------------------------------------------------------------------
-# Thought Leaders Monitor
-# ---------------------------------------------------------------------------
-
-def original_x_url(link: str, handle: str) -> str:
-    match = re.search(r"/status/(\d+)", link)
-    username = handle.lstrip("@")
-    return f"https://x.com/{username}/status/{match.group(1)}" if match else f"https://x.com/{username}"
-
-
-def collect_thought_leaders(config: dict[str, Any], now: dt.datetime,
-                            errors: list[str]) -> tuple[list[Story], list[str]]:
-    """Best recent public item per configured leader, plus availability notes.
-
-    Source priority per leader:
-      1. Direct X posts via public Nitter mirrors (when reachable).
-      2. The leader's own publication feeds (Substack, CFR blog, ...).
-      3. Google News coverage of the leader, clearly labelled as coverage.
-    """
-    cutoff = now.astimezone(dt.timezone.utc) - dt.timedelta(hours=26)
-    candidates: list[Story] = []
-    notes: list[str] = []
-    for leader in config.get("thought_leaders", []):
-        handle = leader.get("handle", "")
-        name = leader.get("name", handle)
-        username = handle.lstrip("@")
-        leader_posts: list[Story] = []
-
-        # 1. X via Nitter mirrors.
-        for instance in config.get("nitter_instances", []):
-            try:
-                posts = parse_feed(name, f"{instance}/{urllib.parse.quote(username)}/rss")
-            except Exception:
-                continue
-            for post in posts:
-                if post.published and post.published.astimezone(dt.timezone.utc) < cutoff:
-                    continue
-                if post.title.startswith("RT by "):
-                    continue
-                post.title = re.sub(r"^R to @[^:]+:\s*", "", post.title).strip()
-                post.link = original_x_url(post.link, handle)
-                post.via = "X"
-                leader_posts.append(post)
-            if leader_posts:
-                break
-
-        # 2. Own publications (Substack, blogs).
-        if not leader_posts:
-            for feed_url in leader.get("feeds", []):
-                try:
-                    posts = parse_feed(name, feed_url)
-                except Exception:
-                    continue
-                for post in posts:
-                    if post.published and post.published.astimezone(dt.timezone.utc) < cutoff:
-                        continue
-                    post.via = "own publication"
-                    leader_posts.append(post)
-
-        # 3. Press coverage as a clearly-labelled fallback.
-        if not leader_posts and leader.get("news_query"):
-            query = urllib.parse.quote(leader["news_query"])
-            try:
-                posts = parse_feed(
-                    name,
-                    f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
-                )
-                for post in posts[:5]:
-                    if post.published and post.published.astimezone(dt.timezone.utc) < cutoff:
-                        continue
-                    post.via = "press coverage"
-                    leader_posts.append(post)
-            except Exception as exc:
-                errors.append(f"Thought leader {handle}: {type(exc).__name__}")
-
-        if leader_posts:
-            for post in leader_posts:
-                post.kind = "leader"
-                post.source = f"{name} ({handle})"
-                post.summary = post.title
-                post.score = rank(post, now) + (4 if post.image_url else 0) + (
-                    10 if post.via == "X" else 6 if post.via == "own publication" else 0
-                )
-            candidates.append(max(leader_posts, key=lambda post: post.score))
-        else:
-            notes.append(f"{name} ({handle}): no retrievable public posts in the last 24 hours.")
-    candidates.sort(key=lambda post: post.score, reverse=True)
-    return candidates, notes
-
-
-# ---------------------------------------------------------------------------
-# Claude curation
-# ---------------------------------------------------------------------------
-
-def claude_call(prompt: str, model: str, max_tokens: int) -> str:
-    api_key = os.environ["ANTHROPIC_API_KEY"]
-    body = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        method="POST",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=120) as response:
-        data = json.loads(response.read())
-    return "".join(
-        block.get("text", "") for block in data.get("content", [])
-        if block.get("type") == "text"
-    )
-
-
-def parse_json_reply(text: str) -> dict[str, Any]:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return json.loads(text)
-
-
-def heuristic_text(story: Story) -> None:
-    story.summary = story.summary or story.description[:360] or story.title
-    story.why = story.why or "Selected for impact, novelty, and relevance."
-
-
-def claude_curate(
-    news_candidates: list[Story],
-    leader_candidates: list[Story],
-    research_candidates: list[Story],
-    config: dict[str, Any],
-    errors: list[str],
-) -> tuple[list[Story], Story | None, Story | None]:
-    """Single Claude call: select, rank, and write summaries for all sections."""
-    top_n = int(config.get("top_news_items", 8))
-
-    def fallback() -> tuple[list[Story], Story | None, Story | None]:
-        top = select_diverse(news_candidates, top_n)
-        for story in top:
-            heuristic_text(story)
-        leader = leader_candidates[0] if leader_candidates else None
-        if leader:
-            leader.summary = leader.summary or leader.title
-        research = research_candidates[0] if research_candidates else None
-        if research:
-            heuristic_text(research)
-        return top, leader, research
-
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        errors.append("ANTHROPIC_API_KEY unavailable; used heuristic selection and feed summaries.")
-        return fallback()
-
-    def pack(stories: list[Story], limit: int) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": index,
-                "title": story.title,
-                "source": story.source,
-                "via": story.via,
-                "description": story.description[:700],
-                "published": story.published.isoformat() if story.published else None,
-            }
-            for index, story in enumerate(stories[:limit])
-        ]
-
-    payload = {
-        "news_candidates": pack(news_candidates, 22),
-        "thought_leader_posts": pack(leader_candidates, 6),
-        "research_candidates": pack(research_candidates, 10),
-    }
-    prompt = (
-        "You are the editor of 'Orhan's Morning Intelligence', a concise daily briefing for a "
-        "university professor interested in AI, economics, finance, technology, science, academic "
-        "research, medicine, and the football World Cup. Rank by Impact x Novelty x Relevance, "
-        "weighting relevance heavily toward AI, economics, finance, academic research, and "
-        "medicine. Avoid celebrity news, entertainment, low-impact political commentary, "
-        "investment-promotion content, and duplicate coverage of the same underlying story.\n\n"
-        f"From news_candidates choose exactly {top_n} items (fewer only if the pool is smaller), "
-        "ordered most consequential first, covering a diverse mix of the priority topics. For each "
-        "write 'summary' (2-3 short factual sentences strictly grounded in the supplied metadata; "
-        "no hype, no invented facts) and 'why' (one short sentence on why it matters to this "
-        "reader).\n\n"
-        "From thought_leader_posts choose the single most notable post (or null if empty) and "
-        "write a 1-2 sentence 'summary'.\n\n"
-        "From research_candidates choose the single most interesting genuine research item (a "
-        "paper, study, or peer-reviewed finding - not general news; null if none qualify) and "
-        "write 'summary' (a one-sentence statement of the finding) and 'why' (one sentence).\n\n"
-        "Return ONLY valid JSON, no markdown fences, in this exact shape:\n"
-        '{"top": [{"id": 0, "summary": "...", "why": "..."}], '
-        '"thought": {"id": 0, "summary": "..."} | null, '
-        '"research": {"id": 0, "summary": "...", "why": "..."} | null}\n\n'
-        + json.dumps(payload, separators=(",", ":"))
-    )
-    model = os.getenv("OMI_MODEL", config.get("claude_model", "claude-sonnet-4-6"))
-    try:
-        reply = parse_json_reply(claude_call(prompt, model, int(config.get("claude_max_tokens", 4000))))
-        top: list[Story] = []
-        for item in reply.get("top", [])[:top_n]:
-            story = news_candidates[int(item["id"])]
-            story.summary = clean_text(item.get("summary")) or story.description[:360]
-            story.why = clean_text(item.get("why")) or "A potentially consequential development."
-            top.append(story)
-        if not top:
-            raise ValueError("Claude returned no top stories")
-        leader = None
-        if reply.get("thought") and leader_candidates:
-            leader = leader_candidates[int(reply["thought"]["id"])]
-            leader.summary = clean_text(reply["thought"].get("summary")) or leader.title
-        elif leader_candidates:
-            leader = leader_candidates[0]
-            leader.summary = leader.title
-        research = None
-        if reply.get("research") and research_candidates:
-            research = research_candidates[int(reply["research"]["id"])]
-            research.summary = clean_text(reply["research"].get("summary")) or research.description[:300]
-            research.why = clean_text(reply["research"].get("why")) or "Notable new research."
-        elif research_candidates:
-            research = research_candidates[0]
-            heuristic_text(research)
-        return top, leader, research
-    except Exception as exc:
-        errors.append(f"Claude curation unavailable ({type(exc).__name__}); used heuristic fallback.")
-        return fallback()
-
-
-# ---------------------------------------------------------------------------
-# Weather
-# ---------------------------------------------------------------------------
-
-def weather(city: str, lat: float, lon: float, timezone: str) -> dict[str, Any]:
-    query = urllib.parse.urlencode({
-        "latitude": lat, "longitude": lon, "timezone": timezone,
-        "temperature_unit": "fahrenheit", "precipitation_unit": "inch",
-        "current": "temperature_2m,weather_code",
-        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
-        "forecast_days": 1,
-    })
-    data = json.loads(fetch(f"https://api.open-meteo.com/v1/forecast?{query}"))
-    code = int(data["current"]["weather_code"])
-    labels = {
-        0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
-        45: "Fog", 48: "Fog", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
-        61: "Light rain", 63: "Rain", 65: "Heavy rain", 71: "Light snow",
-        80: "Rain showers", 81: "Rain showers", 82: "Heavy showers",
-        95: "Thunderstorms", 96: "Thunderstorms", 99: "Severe thunderstorms",
-    }
-    return {
-        "city": city, "current": round(data["current"]["temperature_2m"]),
-        "high": round(data["daily"]["temperature_2m_max"][0]),
-        "low": round(data["daily"]["temperature_2m_min"][0]),
-        "rain": data["daily"]["precipitation_probability_max"][0],
-        "conditions": labels.get(code, "Mixed conditions"),
-    }
-
-
-def esc(value: Any) -> str:
-    return html.escape(str(value), quote=True)
-
-
-# ---------------------------------------------------------------------------
-# Charts (FRED + configured local charts)
-# ---------------------------------------------------------------------------
-
-def log(message: str) -> None:
-    """Diagnostics for the CI log (stderr). Never shown in the email itself."""
-    print(f"[omi] {message}", file=sys.stderr)
-
-
-def file_signature(path: Path) -> str:
-    """Hash of a local file's bytes: 'new' means 'different content'."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(65536), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def load_chart_state() -> dict[str, Any]:
-    if not CHART_STATE.exists():
-        return {}
-    try:
-        return json.loads(CHART_STATE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def chart_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = (
-        [r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\segoeuib.ttf"]
-        if bold else
-        [r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf"]
-    )
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def fred_observations(series_id: str, start: str) -> list[tuple[dt.date, float]]:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-    rows = list(csv.DictReader(fetch(url).decode("utf-8-sig").splitlines()))
-    observations: list[tuple[dt.date, float]] = []
-    for row in rows:
-        try:
-            observations.append((dt.date.fromisoformat(row["observation_date"]), float(row[series_id])))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return observations
-
-
-def nice_tick_step(span: float, target_ticks: int = 5) -> float:
-    """Round a raw tick spacing up to a 'neat' 1/2/2.5/5x10^n step."""
-    if span <= 0:
-        return 1.0
-    raw_step = span / target_ticks
-    magnitude = 10 ** math.floor(math.log10(raw_step))
-    for multiple in (1, 2, 2.5, 5, 10):
-        step = multiple * magnitude
-        if step >= raw_step - 1e-9:
-            return step
-    return 10 * magnitude
-
-
-def draw_line_chart(path: Path, plotted: list[tuple[dt.date, float]], title: str,
-                    subtitle: str, footer: str, unit: str = "%",
-                    zero_baseline: bool = False) -> None:
-    width, height = 600, 300
-    left, top, right, bottom = 58, 54, 22, 45
-    image = Image.new("RGB", (width, height), "#FAF7F0")
-    draw = ImageDraw.Draw(image)
-    title_font = chart_font(20, bold=True)
-    label_font = chart_font(11)
-    small_font = chart_font(10)
-    draw.text((left, 15), title, fill="#17324D", font=title_font)
-    draw.text((left, 38), subtitle, fill="#555555", font=small_font)
-
-    values = [value for _, value in plotted]
-    spread = max(1.0, max(values) - min(values))
-    y_min = min(values) - spread * 0.15
-    y_max = max(values) + spread * 0.15
-    # Only force the axis down to zero for series where "how far from zero"
-    # is part of the story (growth/inflation rates that can turn negative).
-    # For series like interest rates or temperatures, zooming to the data's
-    # actual range shows the trend more clearly and isn't misleading, since
-    # it's a line (trend) chart rather than a bar chart implying magnitude.
-    if zero_baseline and y_min > 0:
-        y_min = 0.0
-    elif zero_baseline:
-        y_min = min(y_min, -1.0)
-
-    tick_step = nice_tick_step(y_max - y_min)
-    y_min = math.floor(y_min / tick_step) * tick_step
-    y_max = max(y_max, y_min + tick_step)
-
-    plot_width = width - left - right
-    plot_height = height - top - bottom
-
-    def point(index: int, value: float) -> tuple[float, float]:
-        x = left + index * plot_width / max(1, len(plotted) - 1)
-        y = top + (y_max - value) * plot_height / (y_max - y_min)
-        return x, y
-
-    decimals = 0 if tick_step >= 1 and tick_step == int(tick_step) else 2 if tick_step < 1 else 1
-    tick = y_min
-    tick_count = 0
-    while tick <= y_max + tick_step * 0.01 and tick_count < 20:
-        y = point(0, tick)[1]
-        if top <= y <= height - bottom:
-            draw.line((left, y, width - right, y), fill="#D6D6D6", width=1)
-            label = f"{tick:.{decimals}f}{unit}"
-            draw.text((8, y - 6), label, fill="#666666", font=small_font)
-        tick += tick_step
-        tick_count += 1
-    if y_min < 0 < y_max:
-        zero_y = point(0, 0)[1]
-        draw.line((left, zero_y, width - right, zero_y), fill="#999999", width=1)
-
-    points = [point(index, value) for index, (_, value) in enumerate(plotted)]
-    draw.line(points, fill="#17324D", width=4, joint="curve")
-    latest_x, latest_y = points[-1]
-    latest_value = plotted[-1][1]
-    draw.ellipse((latest_x - 5, latest_y - 5, latest_x + 5, latest_y + 5), fill="#8A2D3C")
-    draw.text((latest_x - 48, latest_y - 24), f"{latest_value:.1f}{unit}",
-              fill="#8A2D3C", font=label_font)
-
-    first_year = plotted[0][0].year
-    last_year = plotted[-1][0].year
-    year_step = 2 if last_year - first_year > 4 else 1
-    for year in range(first_year, last_year + 1, year_step):
-        nearest = min(range(len(plotted)), key=lambda i: abs(
-            (plotted[i][0] - dt.date(year, 6, 30)).days))
-        x = points[nearest][0]
-        draw.text((x - 13, height - 30), str(year), fill="#666666", font=small_font)
-    draw.text((left, height - 14), footer, fill="#777777", font=small_font)
-    path.parent.mkdir(exist_ok=True)
-    image.save(path, format="PNG", optimize=True)
-
-
-def build_fred_chart(series_id: str, chart_id: str, title: str, subtitle: str,
-                     caption: str, source: str, source_url: str, priority: int,
-                     start: str, yoy_lag: int = 0, years_plotted: int = 10,
-                     unit: str = "%", zero_baseline: bool = False,
-                     explanation_template: str = "") -> dict[str, Any] | None:
-    chart_path = OUTPUT / f"{chart_id}.png"
-    observations = fred_observations(series_id, start)
-    if len(observations) < max(5, yoy_lag + 1):
-        return None
-    if yoy_lag:
-        series = [
-            (observations[i][0], (observations[i][1] / observations[i - yoy_lag][1] - 1) * 100)
-            for i in range(yoy_lag, len(observations))
-        ]
-    else:
-        series = observations
-    latest_date, latest_value = series[-1]
-    previous_value = series[-2][1]
-    cutoff = latest_date.replace(year=latest_date.year - years_plotted)
-    plotted = [(date, value) for date, value in series if date >= cutoff]
-    # The signature is a hash of the data itself. It alone decides whether
-    # this chart counts as "new" (see select_chart_of_the_day) - never file
-    # timestamps, which are reset on every ephemeral CI run.
-    signature = hashlib.sha256(json.dumps(
-        [(date.isoformat(), round(value, 3)) for date, value in series],
-        separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
-    draw_line_chart(chart_path, plotted, title, subtitle, f"Source: {source}", unit,
-                    zero_baseline=zero_baseline)
-
-    direction = "rose" if latest_value > previous_value else "eased" if latest_value < previous_value else "held steady"
-    period = (
-        f"Q{((latest_date.month - 1) // 3) + 1} {latest_date.year}"
-        if series_id == "GDP"
-        else latest_date.strftime("%B %Y") if yoy_lag else latest_date.strftime("%B %#d, %Y" if os.name == "nt" else "%B %-d, %Y")
-    )
-    explanation = explanation_template.format(
-        latest=f"{latest_value:.1f}", previous=f"{previous_value:.1f}",
-        direction=direction, period=period,
-    )
-    return {
-        "id": chart_id,
-        "title": title,
-        "image_path": str(chart_path),
-        "signature": signature,
-        "data_date": latest_date.isoformat(),
-        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "caption": caption,
-        "explanation": explanation,
-        "source": source,
-        "source_url": source_url,
-        "priority": priority,
-    }
-
-
-def fred_chart_sources(errors: list[str]) -> list[dict[str, Any]]:
-    sources: list[dict[str, Any]] = []
-    builders = [
-        dict(series_id="GDP", chart_id="fred_gdp_growth",
-             title="U.S. GDP Growth Over the Last 10 Years",
-             subtitle="Year-over-year percent change in nominal GDP, quarterly",
-             caption="Year-over-year growth in nominal U.S. gross domestic product.",
-             source="U.S. Bureau of Economic Analysis via FRED",
-             source_url="https://fred.stlouisfed.org/series/GDP",
-             priority=10, start="2014-01-01", yoy_lag=4, zero_baseline=True,
-             explanation_template=(
-                 "U.S. nominal GDP was {latest}% higher than a year earlier in {period}, "
-                 "after {previous}% in the preceding quarter. The series captures both "
-                 "changes in real output and the price level.")),
-        dict(series_id="CPIAUCSL", chart_id="fred_cpi_inflation",
-             title="U.S. CPI Inflation Over the Last 10 Years",
-             subtitle="Year-over-year percent change in CPI, all items, monthly",
-             caption="Year-over-year consumer price inflation in the United States.",
-             source="U.S. Bureau of Labor Statistics via FRED",
-             source_url="https://fred.stlouisfed.org/series/CPIAUCSL",
-             priority=10, start="2014-01-01", yoy_lag=12, zero_baseline=True,
-             explanation_template=(
-                 "Consumer prices were {latest}% higher than a year earlier in {period}; "
-                 "inflation {direction} from {previous}% the month before. This is the "
-                 "headline CPI measure most directly comparable with household experience.")),
-        dict(series_id="DGS10", chart_id="fred_treasury_10y",
-             title="10-Year U.S. Treasury Yield",
-             subtitle="Daily market yield, last two years",
-             caption="The benchmark long-term U.S. interest rate.",
-             source="Federal Reserve Board via FRED",
-             source_url="https://fred.stlouisfed.org/series/DGS10",
-             priority=1, start="2024-06-01", yoy_lag=0, years_plotted=2, zero_baseline=False,
-             explanation_template=(
-                 "The 10-year Treasury yield stood at {latest}% as of {period}, "
-                 "{direction} from {previous}% in the prior session. It anchors mortgage "
-                 "rates, corporate borrowing costs, and equity valuations.")),
-    ]
-    for kwargs in builders:
-        try:
-            built = build_fred_chart(**kwargs)
-            if built:
-                sources.append(built)
-            else:
-                errors.insert(0, f"FRED {kwargs['chart_id']}: too few observations")
-        except Exception as exc:
-            # Inserted at the front so the email's 6-item "Source notes"
-            # footer can't truncate a chart failure behind feed noise.
-            errors.insert(0, f"FRED {kwargs['chart_id']}: {type(exc).__name__}")
-    return sources
-
-
-# If no tracked chart has been featured for longer than this, the Chart of the
-# Day pipeline is presumed broken and the email says so (see below). The
-# daily Treasury chart changes every business day, so a healthy pipeline never
-# goes this long without featuring something.
-STALE_CHART_DAYS = 3
-
-
-def local_chart_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Configured chart images present on this machine, identified by content."""
-    sources: list[dict[str, Any]] = []
-    for source in config.get("chart_sources", []):
-        image_path = Path(source["image_path"])
-        if not image_path.is_file():
-            # Expected on CI for charts that live on a personal computer.
-            log(f"chart '{source['id']}': image not found at {image_path}; skipped")
-            continue
-        sources.append({
-            **source,
-            "priority": source.get("priority", 100),
-            "signature": file_signature(image_path),
-            # mtime is a display label only; it never decides anything.
-            "updated_at": dt.datetime.fromtimestamp(
-                image_path.stat().st_mtime, dt.timezone.utc).isoformat(),
-        })
-    return sources
-
-
-def last_featured_at(state: dict[str, Any]) -> dt.datetime | None:
-    stamps: list[dt.datetime] = []
-    for entry in state.values():
-        try:
-            stamps.append(dt.datetime.fromisoformat(entry["featured_at"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return max(stamps) if stamps else None
-
-
-def select_chart_of_the_day(config: dict[str, Any],
-                            errors: list[str] | None = None) -> dict[str, Any] | None:
-    """Pick today's tracked chart, or None when nothing tracked is new.
-
-    A chart is "new" when its content signature differs from the signature
-    recorded when it was last featured. The signature is a hash of the chart's
-    own data (FRED series) or bytes (local images), so the decision depends on
-    nothing but that content: not file timestamps, not what files happen to be
-    left in the working directory, not which machine or CI runner built it.
-    Every source type goes through this one path, so a new data release is
-    picked up automatically with no code or config change.
-    """
-    errors = errors if errors is not None else []
-    state = load_chart_state()
-    sources = local_chart_sources(config)
-    sources.extend(fred_chart_sources(errors))
-
-    candidates: list[dict[str, Any]] = []
-    for source in sources:
-        featured = state.get(source["id"], {}).get("featured_signature")
-        if source["signature"] == featured:
-            log(f"chart '{source['id']}': already featured, data unchanged; skipped")
-            continue
-        log(f"chart '{source['id']}': new data; eligible")
-        candidates.append(source)
-
-    if candidates:
-        # Highest priority first; ties go to the most recent underlying data.
-        chosen = max(candidates, key=lambda item: (
-            item.get("priority", 0), item.get("data_date") or item["updated_at"][:10]))
-        log(f"chart of the day: '{chosen['id']}'")
-        return chosen
-
-    # Nothing new. Fine for a day or two; a long gap means something is broken,
-    # and that must be visible in the email rather than silent.
-    if not sources:
-        errors.insert(0, "Chart of the Day: no tracked chart source could be loaded.")
-    else:
-        last = last_featured_at(state)
-        now = dt.datetime.now(dt.timezone.utc)
-        if last is not None and now - last > dt.timedelta(days=STALE_CHART_DAYS):
-            errors.insert(0, "Chart of the Day: no tracked chart has been featured since "
-                             f"{last.date().isoformat()}; check the chart sources.")
-    return None
-
-
-def select_fallback_chart(now: dt.datetime, errors: list[str]) -> dict[str, Any] | None:
-    """Chart of the Day fallback for when nothing tracked has anything new.
-
-    Looks at a short list of outlets whose posts are themselves built around
-    a chart or graphic (rather than general news that happens to include an
-    image), and features the most recent, most clearly chart-led one with an
-    image, clearly labelled in the newsletter as spotted-in-coverage rather
-    than one of the tracked series.
-    """
-    candidates = recent(deduplicate(collect(FALLBACK_CHART_FEEDS, errors)), now, 96)
-    with_image = [item for item in candidates if item.image_url]
-    if not with_image:
-        return None
-    for item in with_image:
-        text = f"{item.title} {item.description}".lower()
-        item.score = rank(item, now) + (10 if any(k in text for k in CHART_KEYWORDS) else 0)
-    with_image.sort(key=lambda item: item.score, reverse=True)
-    best = with_image[0]
-    return {
-        "id": "fallback",
-        "title": best.title,
-        "image_url": best.image_url,
-        "caption": best.description[:280] or best.title,
-        "explanation": "",
-        "source": best.source,
-        "source_url": best.link,
-        "updated_at": now.isoformat(),
-        "is_fallback": True,
-    }
-
-
-def mark_chart_featured(chart: dict[str, Any] | None) -> None:
-    if not chart or chart.get("is_fallback") or "signature" not in chart:
-        return
-    state = load_chart_state()
-    state[chart["id"]] = {
-        "featured_signature": chart["signature"],
-        "featured_data_date": chart.get("data_date", ""),
-        "featured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-    }
-    CHART_STATE.parent.mkdir(exist_ok=True)
-    CHART_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
-
-def story_html(story: Story, number: int | None = None, show_image: bool = False) -> str:
-    label = f"{number}. " if number else ""
-    visual = ""
-    if show_image and story.image_url:
-        visual = (
-            f'<p><a href="{esc(story.link)}"><img src="{esc(story.image_url)}" width="640" '
-            f'style="max-width:100%;height:auto" alt="{esc(story.image_alt)}"></a>'
-            f'<br><small>Source visual: {esc(story.source)}</small></p>'
-        )
-    return f"""
-      <h3>{label}<a href="{esc(story.link)}">{esc(shorten_title(story.title))}</a></h3>
-      {visual}
-      <p>{esc(story.summary or story.description or story.title)}</p>
-      <blockquote><strong>Why it matters:</strong> {esc(story.why or "Selected for impact and relevance.")}</blockquote>
-      <p><small><strong>{esc(story.source)}</strong> · <a href="{esc(story.link)}">Read original →</a></small></p>
-      <hr>"""
-
-
-def leader_html(post: Story, number: int, timezone: str) -> str:
-    visual = ""
-    if post.image_url:
-        visual = (
-            f'<p><a href="{esc(post.link)}"><img src="{esc(post.image_url)}" width="560" '
-            f'style="max-width:100%;height:auto" alt="{esc(post.image_alt or "Visual attached to the post")}"></a></p>'
-        )
-    time_label = ""
-    if post.published:
-        local = post.published.astimezone(ZoneInfo(timezone))
-        time_label = local.strftime("%#I:%M %p, %B %#d" if os.name == "nt" else "%-I:%M %p, %B %-d")
-    return f"""
-      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="6" bgcolor="#EDE6D6">
-      <tr><td>
-        <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; THOUGHT LEADERS MONITOR</strong></font>
-      </td></tr>
-      </table>
-      <h3>{number}. <a href="{esc(post.link)}">{esc(post.source)}</a></h3>
-      <blockquote>{esc(shorten_title(post.summary or post.title, 140))}</blockquote>
-      {visual}
-      <p><small>{esc(time_label)}{" · " if time_label else ""}<a href="{esc(post.link)}">View original →</a>
-      · <a href="{esc(post.link if post.via == "X" else "https://x.com/" + post.source.split("(@")[-1].rstrip(")"))}">Profile on X</a></small></p>
-      <hr>"""
-
-
-def section_html(title: str, content: str, empty_message: str = "") -> str:
-    body = content or f"<p><em>{esc(empty_message)}</em></p>"
-    return f"""
-    <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0">
-      <tr>
-        <td bgcolor="#17324D" align="left" class="omi-section-title" style="padding:8px 12px;">
-          <font face="Arial, sans-serif" color="#FFFFFF" size="4">
-            <strong>&nbsp; {esc(title)}</strong>
-          </font>
-        </td>
-      </tr>
-    </table>
-    {body}"""
-
-
-def render(config: dict[str, Any], now: dt.datetime, weather_rows: list[dict[str, Any]],
-           top: list[Story], leader_post: Story | None, leader_notes: list[str],
-           research: list[Story], chart_of_day: dict[str, Any] | None,
-           errors: list[str]) -> str:
-    date_label = (
-        now.strftime("%B %-d, %Y, %A")
-        if os.name != "nt"
-        else now.strftime("%B %#d, %Y, %A")
-    )
-    unavailable = "; ".join(errors[:6])
-    source_note = f"<p><small><strong>Source notes:</strong> {esc(unavailable)}</small></p>" if unavailable else ""
-
-    # Top News: insert the thought-leader item among the numbered stories.
-    leader_position = min(3, len(top))
-    items_html: list[str] = []
-    number = 0
-    for index, story in enumerate(top):
-        if leader_post and index == leader_position:
-            number += 1
-            items_html.append(leader_html(leader_post, number, config["timezone"]))
-        number += 1
-        items_html.append(story_html(story, number, show_image=(
-            index < 2 or (story.source in {"Financial Times", "The Economist"} and bool(story.image_url))
-        )))
-    if leader_post and leader_position >= len(top):
-        number += 1
-        items_html.append(leader_html(leader_post, number, config["timezone"]))
-    if not leader_post and leader_notes:
-        items_html.append(
-            "<p><small><em>Thought Leaders Monitor: "
-            + esc(" ".join(leader_notes))
-            + " Direct X retrieval is limited without API access; this is reported "
-            "rather than substituted with unverified content.</em></small></p>"
-        )
-    top_html = "".join(items_html)
-
-    research_html = "".join(story_html(s, show_image=True) for s in research)
-
-    weather_cells = []
-    column_width = f"{100 // len(weather_rows)}%" if weather_rows else "100%"
-    for row in weather_rows:
-        weather_cells.append(f"""
-        <td width="{column_width}" bgcolor="#EDF3F7" valign="top" class="omi-weather-cell" style="padding:10px;">
-          <font face="Arial, sans-serif" color="#17324D" class="omi-weather-text">
-            <strong>{esc(row['city'])}</strong><br>
-            <font size="6" class="omi-temp"><strong>{row['current']}°</strong></font><br>
-            {esc(row.get('conditions', ''))}<br>
-            H {row['high']}° · L {row['low']}° · Rain {row['rain']}%
-          </font>
-        </td>""")
-    weather_table = f"""
-      <table role="presentation" width="100%" border="0" cellspacing="4" cellpadding="10" bgcolor="#DCE7EE" class="omi-weather-table">
-      <tr class="omi-weather-row">{''.join(weather_cells)}</tr>
-      </table>"""
-
-    chart_html = ""
-    if chart_of_day:
-        updated = dt.datetime.fromisoformat(chart_of_day["updated_at"]).astimezone(
-            ZoneInfo(config["timezone"])
-        )
-        updated_label = updated.strftime("%B %#d, %Y") if os.name == "nt" else updated.strftime("%B %-d, %Y")
-        is_fallback = bool(chart_of_day.get("is_fallback"))
-        image_src = esc(chart_of_day["image_url"]) if is_fallback else "cid:chart-of-the-day"
-        fallback_note = (
-            '''<table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="6" bgcolor="#EDE6D6">
-          <tr><td>
-            <font face="Arial, sans-serif" color="#6B5310" size="2"><strong>&#9733; NO TRACKED CHART UPDATED TODAY · SPOTTED IN COVERAGE</strong></font>
-          </td></tr>
-          </table>'''
-            if is_fallback else ""
-        )
-        chart_html = f'''
-          {fallback_note}
-          <h3>{esc(shorten_title(chart_of_day["title"]))}</h3>
-          <p align="center"><img src="{image_src}" width="600" style="max-width:100%;height:auto"
-             alt="{esc(chart_of_day["title"])}"></p>
-          <p>{esc(chart_of_day.get("explanation") or chart_of_day["caption"])}</p>
-          <p><small><strong>Source:</strong> {esc(chart_of_day["source"])}
-          {f'· <a href="{esc(chart_of_day["source_url"])}">View source</a>' if chart_of_day.get("source_url") else ''}
-          · {"Found" if is_fallback else "Updated"} {esc(updated_label)}</small></p>'''
-
-    return f"""<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light">
-<meta name="format-detection" content="telephone=no">
-<style>
-  body,table,td {{ -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }}
-  img {{ -ms-interpolation-mode:bicubic; }}
-  a {{ text-decoration:none; }}
-  h2,h3 {{ line-height:1.25; margin:8px 0 4px; }}
-  p {{ line-height:1.4; margin:4px 0; }}
-  blockquote {{ line-height:1.4; margin:4px 0 6px; padding:6px 10px; }}
-  li {{ line-height:1.4; }}
-  hr {{ margin:6px 0 12px; border:none; border-top:1px solid #E0DCD2; }}
-  @media only screen and (max-width:620px) {{
-    .omi-wrap {{ width:100% !important; }}
-    .omi-pad {{ padding:10px !important; }}
-    .omi-masthead {{ padding:12px 8px !important; }}
-    .omi-title {{ font-size:20px !important; }}
-    .omi-subtitle {{ font-size:10px !important; }}
-    .omi-navbar {{ font-size:9.5px !important; padding:6px 4px !important; }}
-    .omi-navbar-text {{ font-size:9.5px !important; }}
-    .omi-section-title {{ padding:7px 10px !important; }}
-    .omi-section-title font {{ font-size:14px !important; }}
-    .omi-weather-cell {{ padding:6px 4px !important; }}
-    .omi-weather-text {{ font-size:9.5px !important; }}
-    .omi-weather-cell strong {{ font-size:10px !important; }}
-    .omi-temp {{ font-size:18px !important; }}
-    h2 {{ font-size:16px !important; }}
-    h3 {{ font-size:14px !important; }}
-    p, blockquote, li {{ font-size:12.5px !important; }}
-    blockquote {{ margin:4px 0 !important; padding:6px 8px !important; }}
-    small {{ font-size:10.5px !important; }}
-    hr {{ margin:4px 0 8px !important; }}
-  }}
-</style>
-</head>
-<body bgcolor="#E7EDF2">
-<table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="8" bgcolor="#E7EDF2">
-<tr><td align="center">
-  <table role="presentation" width="680" border="0" cellspacing="0" cellpadding="0" bgcolor="#17324D" style="max-width:100%" class="omi-wrap">
-  <tr><td>
-    <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="18" bgcolor="#FAF7F0">
-    <tr><td class="omi-pad">
-      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="12" bgcolor="#17324D">
-      <tr><td align="center" class="omi-masthead">
-        <font face="Georgia, Times New Roman, serif" color="#FFFFFF" size="6" class="omi-title">
-          <strong>{esc(config['newsletter_name'])}</strong>
-        </font><br>
-        <font face="Arial, sans-serif" color="#DDE7EF" size="2" class="omi-subtitle">
-          <strong>{esc(date_label)} &nbsp;·&nbsp; MORNING EDITION</strong>
-        </font>
-      </td></tr>
-      </table>
-
-      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="7" bgcolor="#8A2D3C">
-      <tr><td align="center" class="omi-navbar">
-        <font face="Arial, sans-serif" color="#FFFFFF" size="2" class="omi-navbar-text">
-          WEATHER &nbsp;·&nbsp; TOP NEWS &nbsp;·&nbsp; RESEARCH RADAR &nbsp;·&nbsp; CHART OF THE DAY
-        </font>
-      </td></tr>
-      </table>
-
-      <h2>Good morning</h2>
-      <p>Your high-signal briefing for today. The most consequential items come first.</p>
-
-      {section_html("1 · Weather Snapshot", weather_table)}
-      {section_html("2 · Top News", top_html, "No qualifying stories were available in this run.")}
-      {section_html("3 · Research Radar", research_html, "No qualifying research items were available in this run.")}
-      {section_html("4 · Chart of the Day", chart_html, "No newly updated chart today; the next release of the Walmart tracker, Zillow data, GDP, or CPI will appear here.")}
-      {source_note}
-
-      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="10" bgcolor="#17324D">
-      <tr><td align="center">
-        <font face="Arial, sans-serif" color="#FFFFFF" size="2">
-          <strong>A PERSONAL FIVE-MINUTE BRIEFING</strong>
-        </font>
-      </td></tr>
-      </table>
-    </td></tr>
-    </table>
-  </td></tr>
-  </table>
-</td></tr>
-</table>
-</body></html>"""
-
-
-# ---------------------------------------------------------------------------
-# Delivery
-# ---------------------------------------------------------------------------
-
-BUTTONDOWN_API_ROOT = "https://api.buttondown.com/v1"
-
-
-def buttondown_request(method: str, url: str, api_key: str, *,
-                       json_body: dict[str, Any] | None = None,
-                       raw_body: bytes | None = None,
-                       content_type: str | None = None) -> dict[str, Any]:
-    headers = {
-        "Authorization": f"Token {api_key}",
-        # Required one-time-per-key confirmation for API version 2026-04-01+
-        # before a status change is allowed to actually queue a send.
-        "X-Buttondown-Live-Dangerously": "true",
-    }
-    data: bytes | None = None
-    if json_body is not None:
-        data = json.dumps(json_body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    elif raw_body is not None:
-        data = raw_body
-        if content_type:
-            headers["Content-Type"] = content_type
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Buttondown API {method} {url} failed ({exc.code}): {detail}") from exc
-
-
-def buttondown_upload_image(api_key: str, image_path: Path) -> str:
-    """Upload a local chart PNG so it can be referenced by a public <img src> URL.
-
-    Buttondown's JSON email-creation endpoint has no equivalent of the
-    cid: inline-attachment trick used for Gmail delivery, so the chart image
-    has to be hosted somewhere the recipient's mail client can fetch it.
-    """
-    boundary = f"----OMI{uuid.uuid4().hex}"
-    suffix = image_path.suffix.lower()
-    content_type = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
-    body = (
-        f'--{boundary}\r\n'
-        f'Content-Disposition: form-data; name="image"; filename="{image_path.name}"\r\n'
-        f'Content-Type: {content_type}\r\n\r\n'
-    ).encode("utf-8") + image_path.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
-    result = buttondown_request(
-        "POST", f"{BUTTONDOWN_API_ROOT}/images", api_key,
-        raw_body=body, content_type=f"multipart/form-data; boundary={boundary}",
-    )
-    return result["image"]
-
-
-def send_via_buttondown(config: dict[str, Any], subject: str, body: str,
-                        chart_of_day: dict[str, Any] | None = None) -> None:
-    """Deliver the newsletter through Buttondown instead of Gmail SMTP.
-
-    Buttondown owns the subscriber list (and unsubscribe handling) for
-    everyone who signs up through the website form, so this is now the
-    single delivery path. Safety default: the email is always created as a
-    draft first; it's only advanced to "about_to_send" (which queues actual
-    delivery within a few minutes) when OMI_BUTTONDOWN_LIVE is set truthy.
-    This keeps test_delivery.ps1 from ever emailing real subscribers while
-    still letting the scheduled daily run go out automatically.
-
-    chart_of_day, when given, is the chart already resolved by build() (which
-    may be a fallback chart pulled from coverage rather than a tracked local
-    source) - reusing it here keeps the sent email consistent with what was
-    generated instead of re-resolving independently.
-    """
-    api_key = os.getenv("BUTTONDOWN_API_KEY")
-    if not api_key:
-        raise RuntimeError("Set BUTTONDOWN_API_KEY to enable Buttondown delivery.")
-
-    chart = chart_of_day if chart_of_day is not None else select_chart_of_the_day(config)
-    if chart and "cid:chart-of-the-day" in body:
-        try:
-            hosted_url = buttondown_upload_image(api_key, Path(chart["image_path"]))
-            body = body.replace("cid:chart-of-the-day", hosted_url)
-        except Exception as exc:
-            # Don't let a chart upload failure block the rest of the newsletter.
-            body = body.replace(
-                'src="cid:chart-of-the-day"',
-                f'src="" alt="Chart of the Day unavailable ({esc(exc)})"',
-            )
-
-    created = buttondown_request(
-        "POST", f"{BUTTONDOWN_API_ROOT}/emails", api_key,
-        json_body={"subject": subject, "body": body, "status": "draft"},
-    )
-    email_id = created.get("id")
-    go_live = os.getenv("OMI_BUTTONDOWN_LIVE", "").lower() in {"1", "true", "yes"}
-
-    if go_live and email_id:
-        buttondown_request(
-            "PATCH", f"{BUTTONDOWN_API_ROOT}/emails/{email_id}", api_key,
-            json_body={"status": "about_to_send"},
-        )
-        if os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}:
-            mark_chart_featured(chart)
-        print(f"Buttondown email {email_id} queued to send to subscribers.")
-    else:
-        print(
-            f"Buttondown draft {email_id} created but NOT sent "
-            f"(set OMI_BUTTONDOWN_LIVE=true to actually send, or review/send it "
-            f"manually from https://buttondown.com/emails)."
-        )
-
-
-# --- Legacy Gmail SMTP delivery -------------------------------------------
-# Retained for reference / manual fallback. No longer called by default:
-# Buttondown now owns delivery and subscriber management (see
-# send_via_buttondown above). Kept working in case you ever need to email
-# the config.json recipients directly again.
-
-def send_email(config: dict[str, Any], subject: str, body: str) -> None:
-    user = os.getenv("GMAIL_USER")
-    password = os.getenv("GMAIL_APP_PASSWORD")
-    configured = config.get("recipients") or ["orhanerdem@gmail.com"]
-    override = os.getenv("OMI_RECIPIENTS")
-    recipients = [address.strip() for address in override.split(",")] if override else configured
-    recipients = [address for address in recipients if address]
-    if not user or not password:
-        raise RuntimeError("Set GMAIL_USER and GMAIL_APP_PASSWORD to enable SMTP delivery.")
-    msg = EmailMessage()
-    msg["From"] = f"Orhan's Morning Intelligence <{user}>"
-    msg["To"] = ", ".join(recipients)
-    msg["Subject"] = subject
-    msg.set_content("Orhan's Morning Intelligence is best viewed as HTML.")
-    msg.add_alternative(body, subtype="html")
-    chart = select_chart_of_the_day(config)
-    if chart and "cid:chart-of-the-day" in body:
-        image_path = Path(chart["image_path"])
-        subtype = image_path.suffix.lower().lstrip(".")
-        if subtype == "jpg":
-            subtype = "jpeg"
-        msg.get_payload()[-1].add_related(
-            image_path.read_bytes(),
-            maintype="image",
-            subtype=subtype or "png",
-            cid="<chart-of-the-day>",
-            filename=image_path.name,
-            disposition="inline",
-        )
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as smtp:
-        smtp.login(user, password)
-        smtp.send_message(msg, to_addrs=recipients)
-    if os.getenv("OMI_PRESERVE_CHART_STATE", "").lower() not in {"1", "true", "yes"}:
-        mark_chart_featured(chart)
-
-
-# ---------------------------------------------------------------------------
-# Build
-# ---------------------------------------------------------------------------
-
-def build(no_ai: bool = False) -> tuple[Path, str, dict[str, Any]]:
-    config = load_config()
-    tz = ZoneInfo(config["timezone"])
-    now = dt.datetime.now(tz)
-    errors: list[str] = []
-
-    weather_rows = []
-    for location in config.get("weather_locations", []):
-        city = location["city"]
-        try:
-            weather_rows.append(weather(city, location["latitude"], location["longitude"], config["timezone"]))
-        except Exception as exc:
-            errors.append(f"Weather {city}: {type(exc).__name__}")
-            weather_rows.append({"city": city, "current": "–", "high": "–", "low": "–",
-                                 "rain": "–", "conditions": "Unavailable"})
-
-    news = recent(deduplicate(collect(NEWS_FEEDS, errors)), now, config["lookback_hours"])
-    ft_items = recent(deduplicate(collect([("Financial Times", config["ft_feed"])], errors)), now, 48)
-    economist_items = recent(deduplicate(collect(ECONOMIST_FEEDS, errors)), now, 48)
-    research_pool = recent(deduplicate(collect(RESEARCH_FEEDS, errors)), now, 72)
-    for group in (news, ft_items, economist_items, research_pool):
+            errors.append(f"{loc['city']} {type(exc).__name__}")
+            rows.append({"city": loc["city"], "current": "–", "high": "–", "low": "–",
+                         "rain": "–", "conditions": "Unavailable"})
+    return rows
+
+
+def build_stories(config: dict[str, Any], now: dt.datetime, health: Health, no_ai: bool):
+    """News, thought leader and research items, curated by Claude when possible."""
+    notes = health.notes
+    news_errors: list[str] = []
+    news = recent(deduplicate(collect(NEWS_FEEDS, news_errors)), now, config["lookback_hours"])
+    if len(news_errors) > len(NEWS_FEEDS) // 2:
+        health.problem("news", f"{len(news_errors)} of {len(NEWS_FEEDS)} news feeds failed")
+    notes.extend(f"feed {e}" for e in news_errors)
+
+    ft = recent(deduplicate(collect([("Financial Times", config["ft_feed"])], notes)), now, 48)
+    economist = recent(deduplicate(collect(ECONOMIST_FEEDS, notes)), now, 48)
+    research_pool = recent(deduplicate(collect(RESEARCH_FEEDS, notes)), now, 72)
+    for group in (news, ft, economist, research_pool):
         for item in group:
             item.score = rank(item, now)
         group.sort(key=lambda x: x.score, reverse=True)
 
     news_candidates = deduplicate(
         select_diverse(news, 16, per_category=4, per_source=2)
-        + select_diverse(ft_items + economist_items, 6, per_category=6, per_source=3)
-    )
+        + select_diverse(ft + economist, 6, per_category=6, per_source=3))
     news_candidates.sort(key=lambda x: x.score, reverse=True)
     research_candidates = select_diverse(research_pool, 10, per_category=4, per_source=2)
     for item in research_candidates:
         item.kind = "research"
-    leader_candidates, leader_notes = collect_thought_leaders(config, now, errors)
+    leader_candidates, leader_notes = collect_thought_leaders(config, now, notes)
 
     if no_ai:
         os.environ.pop("ANTHROPIC_API_KEY", None)
-    top, leader_post, research_pick = claude_curate(
-        news_candidates, leader_candidates, research_candidates, config, errors,
-    )
-    research_items = [research_pick] if research_pick else []
+    top, leader, research = claude_curate(
+        news_candidates, leader_candidates, research_candidates, config,
+        health.errors("curation"))
+    if no_ai:
+        health.errors("curation").clear()   # deliberate, not a fault
 
-    total_items = len(top) + (1 if leader_post else 0)
-    if total_items > 10:
-        top = top[:10 - (1 if leader_post else 0)]
+    if len(top) < MIN_TOP_STORIES:
+        health.problem("news", f"only {len(top)} top stories")
+    if not research:
+        health.problem("research", "no research item today")
+    total = len(top) + (1 if leader else 0)
+    if total > 10:
+        top = top[:10 - (1 if leader else 0)]
+    return top, leader, leader_notes, ([research] if research else [])
 
-    chart_of_day = select_chart_of_the_day(config, errors)
-    if not chart_of_day:
-        chart_of_day = select_fallback_chart(now, errors)
-    body = render(config, now, weather_rows, top, leader_post, leader_notes,
-                  research_items, chart_of_day, errors)
-    OUTPUT.mkdir(exist_ok=True)
-    dated = OUTPUT / f"omi_{now:%Y-%m-%d}.html"
-    latest = OUTPUT / "latest.html"
-    dated.write_text(body, encoding="utf-8")
-    latest.write_text(body, encoding="utf-8")
-    manifest = {
-        "generated_at": now.isoformat(),
-        "top_count": len(top),
-        "leader_included": bool(leader_post),
-        "leader_notes": leader_notes,
-        "research_count": len(research_items),
-        "total_item_count": total_items,
-        "chart_of_the_day": chart_of_day,
-        "errors": errors,
-        "stories": [
-            asdict(s) | {"published": s.published.isoformat() if s.published else None}
-            for s in top + ([leader_post] if leader_post else []) + research_items
-        ],
+
+def build_chart(health: Health, now: dt.datetime):
+    errors = health.errors("chart")
+    chart = select_chart_of_the_day(errors)
+    if chart is None:
+        chart = select_fallback_chart(now, health.notes)
+    if chart is None:
+        errors.append("no chart available, tracked or fallback")
+    return chart
+
+
+def build(no_ai: bool, health: Health):
+    config = load_config()
+    now = dt.datetime.now(ZoneInfo(config["timezone"]))
+
+    if not os.getenv("FRED_API_KEY"):
+        health.problem("setup", "FRED_API_KEY is not set; using the throttled anonymous CSV")
+
+    sections: dict[str, Any] = {
+        "weather": ([], lambda: build_weather(config, health)),
+        "stories": (([], None, [], []), lambda: build_stories(config, now, health, no_ai)),
+        "chart": (None, lambda: build_chart(health, now)),
     }
-    (OUTPUT / "latest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
-    date_label = (
-        now.strftime("%B %#d, %Y")
-        if os.name == "nt"
-        else now.strftime("%B %-d, %Y")
-    )
-    return dated, f"{config['newsletter_name']} | {date_label}", manifest
+    results: dict[str, Any] = {}
+    for name, (default, fn) in sections.items():
+        try:
+            results[name] = fn()
+        except Exception as exc:   # one section failing must not stop the rest
+            log(traceback.format_exc())
+            health.problem(name if name != "stories" else "news", f"crashed: {type(exc).__name__}: {exc}")
+            results[name] = default
+
+    top, leader, leader_notes, research = results["stories"]
+    body = render(config, now, results["weather"], top, leader, leader_notes,
+                  research, results["chart"])
+    OUTPUT.mkdir(exist_ok=True)
+    dated = OUTPUT / f"omb_{now:%Y-%m-%d}.html"
+    dated.write_text(body, encoding="utf-8")
+    (OUTPUT / "latest.html").write_text(body, encoding="utf-8")
+    (OUTPUT / "latest.json").write_text(json.dumps({
+        "generated_at": now.isoformat(),
+        "chart_of_the_day": results["chart"],
+        "stories": [asdict(s) | {"published": s.published.isoformat() if s.published else None}
+                    for s in top + ([leader] if leader else []) + research],
+    }, indent=2, default=str), encoding="utf-8")
+    date_label = now.strftime("%B %#d, %Y" if os.name == "nt" else "%B %-d, %Y")
+    return f"{config['newsletter_name']} | {date_label}", body, results["chart"]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Intelligence.")
-    parser.add_argument("--no-send", action="store_true", help="Generate files without sending email.")
-    parser.add_argument("--no-ai", action="store_true", help="Use feed descriptions instead of Claude summaries.")
+    parser = argparse.ArgumentParser(description="Generate and deliver Orhan's Morning Brief.")
+    parser.add_argument("--no-send", action="store_true", help="Build files without sending.")
+    parser.add_argument("--no-ai", action="store_true", help="Skip Claude; use feed text.")
     args = parser.parse_args()
-    path, subject, manifest = build(no_ai=args.no_ai)
-    body = path.read_text(encoding="utf-8")
-    print(json.dumps({
-        "subject": subject,
-        "html": str(path),
-        **{k: manifest[k] for k in (
-            "top_count", "leader_included", "research_count", "total_item_count", "errors"
-        )},
-    }, indent=2))
-    if not args.no_send:
-        send_via_buttondown(load_config(), subject, body, manifest.get("chart_of_the_day"))
-    return 0
+
+    health = Health()
+    try:
+        subject, body, chart = build(args.no_ai, health)
+        if not args.no_send:
+            send_via_buttondown(subject, body, chart)
+    except Exception as exc:
+        health.problem("run", f"failed: {type(exc).__name__}: {exc}")
+        health.write()
+        send_alert("Morning Brief FAILED", f"The run crashed.\n\n{traceback.format_exc()}")
+        raise
+
+    health.write()
+    if health.ok:
+        print("health: ok")
+        return 0
+    print(f"health: NEEDS ATTENTION - {health.summary()}", file=sys.stderr)
+    # Don't alert on a manual --no-send/test build; do on every real run.
+    if not args.no_send and not os.getenv("OMI_PRESERVE_CHART_STATE"):
+        send_alert("Morning Brief needs attention",
+                   f"Today's edition went out, but:\n\n{health.summary()}\n\n"
+                   "Details: the run log, and output/health.json in the Actions run.")
+    return 0   # the workflow's final "health gate" step turns the run red
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        raise
+    raise SystemExit(main())
