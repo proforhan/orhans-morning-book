@@ -100,6 +100,17 @@ jobs:
           OMI_BUTTONDOWN_LIVE: ${{ steps.guard.outputs.mark }}
         run: python main.py
 
+      - name: Keep the built newsletter for inspection
+        if: always() && steps.guard.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: newsletter-output
+          path: |
+            output/latest.html
+            output/health.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Record today's send
         if: steps.guard.outputs.run == 'true' && steps.guard.outputs.mark == 'true'
         run: |
@@ -121,3 +132,17 @@ jobs:
           else
             echo "No state change to commit."
           fi
+
+      - name: Health gate (turns the run red if anything needs attention)
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          python - <<'PY'
+          import json, sys
+          h = json.load(open("output/health.json"))
+          if h["ok"]:
+              print("Health: ok")
+              sys.exit(0)
+          for section, msgs in h["problems"].items():
+              print(f"::error title=Morning Brief: {section}::{'; '.join(msgs)}")
+          sys.exit(1)
+          PY
