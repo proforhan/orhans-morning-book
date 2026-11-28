@@ -34,9 +34,9 @@
     "featured_signature": "a1ed570f988f0de656219d6df21a33e128a15e64984d22d6c9e00dcac0253cad"
   },
   "fred_cpi_inflation": {
-    "featured_mtime": 1786705306.080622,
-    "featured_at": "2026-08-14T11:01:48.263025+00:00",
-    "featured_signature": "8f5614593486d901062ce9e57ab8487dfc13e8125112086f2e7c0dc63ef48a8c"
+    "featured_signature": "7768945f51e9fec350de79b09c22e90edc761eaa8f0d377bf82692404dfb3310",
+    "featured_data_date": "2026-10-01",
+    "featured_at": "2026-11-28T12:01:05.524692+00:00"
   },
   "fred_mortgage_30y": {
     "featured_mtime": 1787396494.224716,
